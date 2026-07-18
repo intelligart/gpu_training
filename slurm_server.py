@@ -53,15 +53,18 @@ def generate_script(
     branch: str = "main",
     repo_dir: str = "",
     repo_url: str = "",
+    mem: str = "",
 ) -> Path:
     """動態產生 sbatch script，回傳路徑"""
     GENERATED_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
     nodelist_line = f"#SBATCH --nodelist={nodelist}" if nodelist else ""
+    mem_line = f"#SBATCH --mem={mem}" if mem else ""
     work_dir = repo_dir or DEFAULT_REPO_DIR
 
     if repo_url:
         git_sync = f"""
+git config --global --add safe.directory '*'
 if [ ! -d "{work_dir}/.git" ]; then
     git clone {repo_url} {work_dir}
 fi
@@ -72,6 +75,7 @@ git pull origin {branch}
 """
     else:
         git_sync = f"""
+git config --global --add safe.directory '*'
 cd {work_dir}
 git pull origin {branch}
 """
@@ -83,6 +87,7 @@ git pull origin {branch}
 #SBATCH --output=/tmp/slurm_{job_name}_%j.out
 #SBATCH --time=02:00:00
 {nodelist_line}
+{mem_line}
 {VENV_ACTIVATE}
 {git_sync}
 {command}
@@ -104,11 +109,12 @@ def submit_job(
     branch: str = "main",
     repo_dir: str = "",
     repo_url: str = "",
+    mem: str = "",
 ) -> dict:
     """提交 sbatch job。可指定現有 script_path 或直接給 command 動態產生"""
     if command:
         name = job_name or "job"
-        path = generate_script(command, gpu=gpu, job_name=name, nodelist=nodelist, branch=branch, repo_dir=repo_dir, repo_url=repo_url)
+        path = generate_script(command, gpu=gpu, job_name=name, nodelist=nodelist, branch=branch, repo_dir=repo_dir, repo_url=repo_url, mem=mem)
     elif script_path:
         if not Path(script_path).exists():
             return {"success": False, "error": f"Script not found: {script_path}"}
@@ -150,6 +156,37 @@ def parse_queue_output(stdout: str) -> list[dict]:
                 "nodes": parts[5] if len(parts) > 5 else "",
             })
     return jobs
+
+
+def get_gpu_alloc() -> dict:
+    """計算每台節點已分配的 GPU 數量"""
+    # 從 sinfo 取得每台節點的 GPU 總數
+    stdout, _, rc = run_cmd([SINFO, "-N", "-o", "%N %G"])
+    node_total = {}
+    if rc == 0:
+        for line in stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                node = parts[0]
+                m = __import__('re').search(r'gpu:(\d+)', parts[1])
+                node_total[node] = int(m.group(1)) if m else 0
+
+    # 從 squeue 取得 RUNNING job 的 GPU 分配
+    stdout, _, rc = run_cmd([SQUEUE, "-t", "RUNNING", "-o", "%N %b"])
+    node_alloc = {n: 0 for n in node_total}
+    if rc == 0:
+        for line in stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                node = parts[0]
+                m = __import__('re').search(r'gpu:(\d+)', parts[1])
+                if m and node in node_alloc:
+                    node_alloc[node] += int(m.group(1))
+
+    return {
+        node: {"alloc": node_alloc.get(node, 0), "total": total}
+        for node, total in node_total.items()
+    }
 
 
 def get_queue(user: Optional[str] = None) -> str:
@@ -441,29 +478,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
     }
 
-    function nodeCardHTML(node) {
+    function nodeCardHTML(node, gpuData) {
       const state = node.state.toLowerCase();
       const stateClass = state.includes('idle') ? 'state-idle' :
                          state.includes('alloc') ? 'state-alloc' :
                          state.includes('mix') ? 'state-mix' : 'state-down';
       const cardClass = state.includes('idle') ? 'idle' : 'busy';
 
-      // parse GPU count from gres like "gpu:2" or "gpu:a6000:2"
-      const gpuMatch = node.gres.match(/gpu:(\d+)$/i) || node.gres.match(/gpu:[^:]+:(\d+)/i);
-      const gpuCount = gpuMatch ? gpuMatch[1] : node.gres.replace('gpu:', '') || '?';
-      const gpuModel = 'GPU';
+      // GPU alloc from /gpu-alloc endpoint
+      const gpuInfo = (gpuData || {})[node.name] || {};
+      const gpuAlloc = gpuInfo.alloc || 0;
+      const gpuTotal = gpuInfo.total || 0;
+      const gpuPct = gpuTotal > 0 ? Math.round(gpuAlloc / gpuTotal * 100) : 0;
 
       // parse CPU allocated/total from "A/I/O/T"
       const cpuParts = node.cpus.split('/');
       const cpuAlloc = parseInt(cpuParts[0]) || 0;
       const cpuTotal = parseInt(cpuParts[3]) || 1;
-      const cpuPct = Math.round(cpuAlloc / cpuTotal * 100);
 
       return `
         <div class="node-card ${cardClass}">
           <div class="node-name">${node.name}</div>
-          <div class="node-meta">GPU: ${gpuModel} × ${gpuCount} &nbsp;|&nbsp; CPU: ${cpuAlloc}/${cpuTotal}</div>
-          <div class="gpu-bar-wrap"><div class="gpu-bar ${cpuPct > 80 ? 'full' : ''}" style="width:${cpuPct}%"></div></div>
+          <div class="node-meta">GPU: ${gpuAlloc}/${gpuTotal} allocated &nbsp;|&nbsp; CPU: ${cpuAlloc}/${cpuTotal}</div>
+          <div class="gpu-bar-wrap"><div class="gpu-bar ${gpuPct > 80 ? 'full' : ''}" style="width:${gpuPct}%"></div></div>
           <span class="node-state ${stateClass}">${node.state}</span>
         </div>`;
     }
@@ -484,15 +521,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function refresh() {
       try {
-        const [clusterRes, queueRes] = await Promise.all([
-          fetch('/cluster'), fetch('/queue')
+        const [clusterRes, queueRes, gpuRes] = await Promise.all([
+          fetch('/cluster'), fetch('/queue'), fetch('/gpu-alloc')
         ]);
         const clusterData = await clusterRes.json();
         const queueData = await queueRes.json();
+        const gpuData = await gpuRes.json();
 
         const nodes = parseCluster(clusterData.output || '');
         document.getElementById('cluster-grid').innerHTML =
-          nodes.length ? nodes.map(nodeCardHTML).join('') : '<div style="color:#475569;padding:16px">No nodes found</div>';
+          nodes.length ? nodes.map(n => nodeCardHTML(n, gpuData)).join('') : '<div style="color:#475569;padding:16px">No nodes found</div>';
 
         const jobs = queueData.jobs || [];
         document.getElementById('queue-body').innerHTML =
@@ -575,6 +613,7 @@ def run_http_server(port: int = 8765):
         branch: str = "main"
         repo_dir: str = ""           # e.g. "/storage/SSD2/alice/my_project"
         repo_url: str = ""           # e.g. "git@github.com:org/repo.git"
+        mem: str = ""                # e.g. "32G", "16G" (預設用 DefMemPerCPU)
         script_path: str = ""        # legacy: 直接指定現有 script
 
     @app.post("/submit")
@@ -588,6 +627,7 @@ def run_http_server(port: int = 8765):
             branch=req.branch,
             repo_dir=req.repo_dir,
             repo_url=req.repo_url,
+            mem=req.mem,
         )
         if not result["success"]:
             raise HTTPException(status_code=400, detail=result["error"])
@@ -611,6 +651,10 @@ def run_http_server(port: int = 8765):
     @app.get("/cluster")
     def cluster():
         return {"output": get_cluster_info()}
+
+    @app.get("/gpu-alloc")
+    def gpu_alloc():
+        return get_gpu_alloc()
 
     @app.get("/scripts")
     def scripts():
