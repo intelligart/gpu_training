@@ -16,8 +16,10 @@ import os
 import argparse
 import tempfile
 import shlex
+import sqlite3
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 SLURM_CONF = "/etc/slurm/slurm.conf"
 SBATCH = "/usr/bin/sbatch"
@@ -38,6 +40,86 @@ esac
 """
 
 DEFAULT_REPO_DIR = "/storage/SSD2/hank/gpu_training"
+SLURMJOB_BASE = Path("/storage/SSD2/slurmjob")
+DB_PATH = Path("/storage/SSD2/hank/gpu_training/slurm_history.db")
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT,
+            username TEXT,
+            job_name TEXT,
+            command TEXT,
+            gpu INTEGER,
+            nodelist TEXT,
+            repo_dir TEXT,
+            repo_url TEXT,
+            branch TEXT,
+            submit_time TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def record_job(job_id: str, username: str, job_name: str, command: str,
+               gpu: int, nodelist: str, repo_dir: str, repo_url: str, branch: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        INSERT INTO jobs (job_id, username, job_name, command, gpu, nodelist, repo_dir, repo_url, branch, submit_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (job_id, username, job_name, command, gpu, nodelist, repo_dir, repo_url, branch,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
+
+def get_history(limit: int = 100) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_jobs(days: int = 30):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "DELETE FROM jobs WHERE submit_time < datetime('now', ?)",
+        (f"-{days} days",)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_stats() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    stats = {}
+    # jobs per user
+    rows = conn.execute(
+        "SELECT username, COUNT(*) as count, SUM(gpu) as total_gpu FROM jobs GROUP BY username ORDER BY count DESC"
+    ).fetchall()
+    stats["by_user"] = [{"username": r[0], "jobs": r[1], "total_gpu": r[2] or 0} for r in rows]
+    # jobs per node
+    rows = conn.execute(
+        "SELECT nodelist, COUNT(*) as count FROM jobs WHERE nodelist != '' GROUP BY nodelist ORDER BY count DESC"
+    ).fetchall()
+    stats["by_node"] = [{"node": r[0], "jobs": r[1]} for r in rows]
+    # total
+    row = conn.execute("SELECT COUNT(*), SUM(gpu) FROM jobs").fetchone()
+    stats["total_jobs"] = row[0] or 0
+    stats["total_gpu_requested"] = row[1] or 0
+    conn.close()
+    return stats
+
+
+init_db()
+cleanup_old_jobs(days=30)
 
 
 def run_cmd(cmd: list[str]) -> tuple[str, str, int]:
@@ -54,6 +136,7 @@ def generate_script(
     repo_dir: str = "",
     repo_url: str = "",
     mem: str = "",
+    venv: str = "",
 ) -> Path:
     """動態產生 sbatch script，回傳路徑"""
     GENERATED_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -62,22 +145,25 @@ def generate_script(
     mem_line = f"#SBATCH --mem={mem}" if mem else ""
     work_dir = repo_dir or DEFAULT_REPO_DIR
 
+    if venv:
+        venv_activate = f"source {venv}/bin/activate"
+    else:
+        venv_activate = VENV_ACTIVATE
+
     if repo_url:
         git_sync = f"""
-git config --global --add safe.directory '*'
 if [ ! -d "{work_dir}/.git" ]; then
     git clone {repo_url} {work_dir}
 fi
 cd {work_dir}
-git fetch origin
-git checkout {branch}
-git pull origin {branch}
+git config --local --add safe.directory '{work_dir}'
+flock -w 60 .git/config sh -c 'git fetch origin && git checkout {branch} && git pull origin {branch}'
 """
     else:
         git_sync = f"""
-git config --global --add safe.directory '*'
 cd {work_dir}
-git pull origin {branch}
+git config --local --add safe.directory '{work_dir}'
+flock -w 60 .git/config git pull origin {branch}
 """
 
     script = f"""#!/bin/bash
@@ -88,7 +174,7 @@ git pull origin {branch}
 #SBATCH --time=02:00:00
 {nodelist_line}
 {mem_line}
-{VENV_ACTIVATE}
+{venv_activate}
 {git_sync}
 {command}
 """
@@ -110,11 +196,12 @@ def submit_job(
     repo_dir: str = "",
     repo_url: str = "",
     mem: str = "",
+    venv: str = "",
 ) -> dict:
     """提交 sbatch job。可指定現有 script_path 或直接給 command 動態產生"""
     if command:
         name = job_name or "job"
-        path = generate_script(command, gpu=gpu, job_name=name, nodelist=nodelist, branch=branch, repo_dir=repo_dir, repo_url=repo_url, mem=mem)
+        path = generate_script(command, gpu=gpu, job_name=name, nodelist=nodelist, branch=branch, repo_dir=repo_dir, repo_url=repo_url, mem=mem, venv=venv)
     elif script_path:
         if not Path(script_path).exists():
             return {"success": False, "error": f"Script not found: {script_path}"}
@@ -153,7 +240,9 @@ def parse_queue_output(stdout: str) -> list[dict]:
                 "user": parts[2],
                 "state": parts[3],
                 "time": parts[4],
-                "nodes": parts[5] if len(parts) > 5 else "",
+                "gres": parts[5] if len(parts) > 5 else "",
+                "nodes": parts[6] if len(parts) > 6 else "",
+                "req_nodes": parts[7] if len(parts) > 7 else "",
             })
     return jobs
 
@@ -191,7 +280,7 @@ def get_gpu_alloc() -> dict:
 
 def get_queue(user: Optional[str] = None) -> str:
     """查看 job queue"""
-    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %N"]
+    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %10b %N %v"]
     if user:
         cmd += ["-u", user]
     stdout, stderr, rc = run_cmd(cmd)
@@ -200,7 +289,7 @@ def get_queue(user: Optional[str] = None) -> str:
 
 def get_queue_json(user: Optional[str] = None) -> list[dict]:
     """查看 job queue，回傳結構化 JSON"""
-    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %N"]
+    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %10b %N %v"]
     if user:
         cmd += ["-u", user]
     stdout, stderr, rc = run_cmd(cmd)
@@ -267,6 +356,8 @@ def run_mcp_server():
         branch: str = "main",
         repo_dir: str = "",
         repo_url: str = "",
+        mem: str = "",
+        venv: str = "",
     ) -> str:
         """
         提交 Slurm job。自動產生 sbatch script 並提交。
@@ -277,6 +368,8 @@ def run_mcp_server():
         branch: git branch（預設 main）
         repo_dir: repo 在節點上的本地路徑（選填，預設 /storage/SSD2/hank/gpu_training）
         repo_url: git remote URL，若 repo_dir 不存在會自動 clone（選填）
+        mem: 記憶體大小，例如 32G（選填，預設 4GB/CPU）
+        venv: venv 路徑，例如 /storage/SSD2/alice/venv（選填）
         """
         result = submit_job(
             command=command,
@@ -286,6 +379,8 @@ def run_mcp_server():
             branch=branch,
             repo_dir=repo_dir,
             repo_url=repo_url,
+            mem=mem,
+            venv=venv,
         )
         if result["success"]:
             return f"✓ Job submitted! Job ID: {result['job_id']}\nScript: {result['script']}"
@@ -401,6 +496,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .toast.show { opacity: 1; transform: translateY(0); }
     .toast.success { background: #14532d; color: #4ade80; border: 1px solid #166534; }
     .toast.error { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
+
+    /* Stats */
+    .stat-card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 16px 20px; }
+    .stat-number { font-size: 28px; font-weight: 700; color: #a78bfa; margin-bottom: 4px; }
+    .stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
+    .stat-row { margin-top: 10px; font-size: 12px; color: #64748b; display: flex; justify-content: space-between; border-top: 1px solid #2d3148; padding-top: 8px; }
+
+    /* Log modal */
+    .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+    .modal-backdrop.show { display: flex; }
+    .modal { background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; width: 800px; max-width: 95vw; max-height: 80vh; display: flex; flex-direction: column; }
+    .modal-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid #2d3148; }
+    .modal-title { font-size: 14px; font-weight: 600; color: #a78bfa; }
+    .modal-close { background: none; border: none; color: #64748b; font-size: 20px; cursor: pointer; line-height: 1; }
+    .modal-close:hover { color: #e2e8f0; }
+    .modal-body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+    .log-content { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; color: #94a3b8; white-space: pre-wrap; word-break: break-all; line-height: 1.6; }
+    .log-file { font-size: 11px; color: #475569; margin-bottom: 12px; }
   </style>
 </head>
 <body>
@@ -419,8 +532,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="section-title">Job Queue</div>
       <div class="queue-wrap">
         <table>
-          <thead><tr><th>Job ID</th><th>Name</th><th>User</th><th>State</th><th>Time</th><th>Node</th><th></th></tr></thead>
+          <thead><tr><th>Job ID</th><th>Name</th><th>User</th><th>State</th><th>Time</th><th>GPU</th><th>Node</th><th>Requested</th><th></th></tr></thead>
           <tbody id="queue-body"><tr><td colspan="7" class="empty-state">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Statistics (Last 30 Days)</div>
+      <div class="cluster-grid" id="stats-grid"><div class="node-card"><div class="node-name" style="color:#475569">Loading...</div></div></div>
+    </div>
+
+    <div>
+      <div class="section-title">Job History</div>
+      <div class="queue-wrap">
+        <table>
+          <thead><tr><th>Job ID</th><th>Name</th><th>User</th><th>GPU</th><th>Node</th><th>Branch</th><th>Submitted</th><th></th></tr></thead>
+          <tbody id="history-body"><tr><td colspan="8" class="empty-state">Loading...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -432,6 +560,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="form-full">
             <label>Command</label>
             <input id="f-command" type="text" placeholder="python3 -u train.py --lr 0.001 --epochs 50">
+          </div>
+          <div>
+            <label>Username <span style="color:#f87171">*</span></label>
+            <input id="f-username" type="text" placeholder="alice">
           </div>
           <div>
             <label>Job Name</label>
@@ -461,11 +593,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <label>Repo URL (optional, auto-clone if dir missing)</label>
             <input id="f-repourl" type="text" placeholder="git@github.com:org/repo.git">
           </div>
+          <div class="form-full">
+            <label>Venv Path (optional)</label>
+            <input id="f-venv" type="text" placeholder="/storage/SSD2/alice/venv">
+          </div>
         </div>
         <button class="btn-submit" id="btn-submit" onclick="submitJob()">Submit Job</button>
       </div>
     </div>
   </main>
+
+  <!-- Log Modal -->
+  <div class="modal-backdrop" id="log-modal" onclick="closeLogModal(event)">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" id="modal-title">Job Log</div>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="log-file" id="log-file"></div>
+        <div class="log-content" id="log-content">Loading...</div>
+      </div>
+    </div>
+  </div>
 
   <div class="toast" id="toast"></div>
 
@@ -508,15 +658,63 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function queueRowHTML(job) {
       const badgeClass = job.state === 'RUNNING' ? 'badge-running' :
                          job.state === 'PENDING' ? 'badge-pending' : 'badge-other';
+      const gpuMatch = job.gres ? job.gres.match(/gpu:(\d+)/) : null;
+      const gpuCount = gpuMatch ? gpuMatch[1] : '—';
       return `<tr>
         <td style="color:#94a3b8">${job.job_id}</td>
         <td style="color:#e2e8f0;font-weight:600">${job.name}</td>
         <td style="color:#94a3b8">${job.user}</td>
         <td><span class="badge ${badgeClass}">${job.state}</span></td>
         <td style="color:#64748b">${job.time}</td>
+        <td style="color:#a78bfa;font-weight:600">${gpuCount}</td>
         <td style="color:#64748b">${job.nodes || '—'}</td>
-        <td><button onclick="cancelJob('${job.job_id}')" style="background:none;border:1px solid #3b3460;color:#94a3b8;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">cancel</button></td>
+        <td style="color:#475569;font-size:12px">${job.req_nodes && job.req_nodes !== 'N/A' ? job.req_nodes : '—'}</td>
+        <td style="display:flex;gap:4px">
+          <button onclick="showLog('${job.job_id}','${job.name}')" style="background:none;border:1px solid #1e3a5f;color:#60a5fa;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">log</button>
+          <button onclick="cancelJob('${job.job_id}')" style="background:none;border:1px solid #3b3460;color:#94a3b8;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">cancel</button>
+        </td>
       </tr>`;
+    }
+
+    async function refreshStats() {
+      try {
+        const [statsRes, histRes] = await Promise.all([fetch('/stats'), fetch('/history?limit=50')]);
+        const stats = await statsRes.json();
+        const hist = await histRes.json();
+
+        // Stats cards
+        const byUser = stats.by_user || [];
+        let statsHtml = `
+          <div class="stat-card">
+            <div class="stat-number">${stats.total_jobs}</div>
+            <div class="stat-label">Total Jobs</div>
+            <div class="stat-row"><span>GPU hours requested</span><span style="color:#a78bfa">${stats.total_gpu_requested}</span></div>
+          </div>`;
+        byUser.forEach(u => {
+          statsHtml += `
+            <div class="stat-card">
+              <div class="stat-number">${u.jobs}</div>
+              <div class="stat-label">${u.username}</div>
+              <div class="stat-row"><span>Total GPU requested</span><span style="color:#a78bfa">${u.total_gpu}</span></div>
+            </div>`;
+        });
+        document.getElementById('stats-grid').innerHTML = statsHtml;
+
+        // History table
+        const jobs = hist.jobs || [];
+        document.getElementById('history-body').innerHTML = jobs.length
+          ? jobs.map(j => `<tr>
+              <td style="color:#94a3b8">${j.job_id}</td>
+              <td style="color:#e2e8f0;font-weight:600">${j.job_name}</td>
+              <td style="color:#94a3b8">${j.username}</td>
+              <td style="color:#a78bfa;font-weight:600">${j.gpu}</td>
+              <td style="color:#64748b">${j.nodelist || '—'}</td>
+              <td style="color:#64748b">${j.branch}</td>
+              <td style="color:#475569;font-size:12px">${j.submit_time}</td>
+              <td><button onclick="showLog('${j.job_id}','${j.job_name}')" style="background:none;border:1px solid #1e3a5f;color:#60a5fa;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">log</button></td>
+            </tr>`).join('')
+          : '<tr><td colspan="8" class="empty-state">No history yet</td></tr>';
+      } catch(e) {}
     }
 
     async function refresh() {
@@ -546,7 +744,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function submitJob() {
       const command = document.getElementById('f-command').value.trim();
+      const username = document.getElementById('f-username').value.trim();
       if (!command) { showToast('Command is required', 'error'); return; }
+      if (!username) { showToast('Username is required', 'error'); return; }
       const btn = document.getElementById('btn-submit');
       btn.disabled = true; btn.textContent = 'Submitting...';
       try {
@@ -555,12 +755,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             command,
+            username,
             job_name: document.getElementById('f-jobname').value || 'job',
             gpu: parseInt(document.getElementById('f-gpu').value),
             branch: document.getElementById('f-branch').value || 'main',
             nodelist: document.getElementById('f-nodelist').value,
             repo_dir: document.getElementById('f-repodir').value,
             repo_url: document.getElementById('f-repourl').value,
+            venv: document.getElementById('f-venv').value,
           })
         });
         const data = await res.json();
@@ -590,8 +792,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       setTimeout(() => { t.className = 'toast'; }, 3000);
     }
 
+    async function showLog(jobId, jobName) {
+      document.getElementById('modal-title').textContent = `Log — ${jobName} (${jobId})`;
+      document.getElementById('log-file').textContent = '';
+      document.getElementById('log-content').textContent = 'Loading...';
+      document.getElementById('log-modal').classList.add('show');
+      try {
+        const res = await fetch('/logs/' + jobId);
+        const data = await res.json();
+        document.getElementById('log-file').textContent = data.file || '';
+        document.getElementById('log-content').textContent = data.log || '(empty)';
+      } catch(e) {
+        document.getElementById('log-content').textContent = 'Error loading log';
+      }
+    }
+
+    function closeModal() {
+      document.getElementById('log-modal').classList.remove('show');
+    }
+
+    function closeLogModal(e) {
+      if (e.target === document.getElementById('log-modal')) closeModal();
+    }
+
     refresh();
+    refreshStats();
     setInterval(refresh, 5000);
+    setInterval(refreshStats, 30000);
   </script>
 </body>
 </html>"""
@@ -607,17 +834,40 @@ def run_http_server(port: int = 8765):
 
     class SubmitRequest(BaseModel):
         command: str                  # e.g. "python3 -u train.py --lr 0.001"
+        username: str                 # e.g. "alice" — determines /storage/SSD2/slurmjob/<username>/
         gpu: int = 1
         job_name: str = "job"
         nodelist: str = ""
         branch: str = "main"
-        repo_dir: str = ""           # e.g. "/storage/SSD2/alice/my_project"
+        repo_dir: str = ""           # must be under /storage/SSD2/slurmjob/<username>/
         repo_url: str = ""           # e.g. "git@github.com:org/repo.git"
         mem: str = ""                # e.g. "32G", "16G" (預設用 DefMemPerCPU)
+        venv: str = ""               # e.g. "/storage/SSD2/alice/venv"
         script_path: str = ""        # legacy: 直接指定現有 script
 
     @app.post("/submit")
     def submit(req: SubmitRequest):
+        if not req.username:
+            raise HTTPException(status_code=400, detail="username is required")
+
+        user_base = SLURMJOB_BASE / req.username
+
+        # Determine repo_dir: default to user base if not specified
+        if req.repo_dir:
+            repo_dir_path = Path(req.repo_dir).resolve()
+            user_base_resolved = user_base.resolve()
+            # Enforce repo_dir must be under /storage/SSD2/slurmjob/<username>/
+            try:
+                repo_dir_path.relative_to(user_base_resolved)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"repo_dir must be under {user_base}/ (got: {req.repo_dir})"
+                )
+            repo_dir = str(repo_dir_path)
+        else:
+            repo_dir = str(user_base)
+
         result = submit_job(
             command=req.command or None,
             script_path=req.script_path or None,
@@ -625,12 +875,25 @@ def run_http_server(port: int = 8765):
             job_name=req.job_name or None,
             nodelist=req.nodelist or None,
             branch=req.branch,
-            repo_dir=req.repo_dir,
+            repo_dir=repo_dir,
             repo_url=req.repo_url,
             mem=req.mem,
+            venv=req.venv,
         )
         if not result["success"]:
             raise HTTPException(status_code=400, detail=result["error"])
+        # Record to SQLite
+        record_job(
+            job_id=result["job_id"],
+            username=req.username,
+            job_name=req.job_name or "job",
+            command=req.command,
+            gpu=req.gpu,
+            nodelist=req.nodelist or "",
+            repo_dir=repo_dir,
+            repo_url=req.repo_url,
+            branch=req.branch,
+        )
         return result
 
     @app.get("/queue")
@@ -647,6 +910,27 @@ def run_http_server(port: int = 8765):
         if not result["success"]:
             raise HTTPException(status_code=400, detail=result["error"])
         return result
+
+    @app.get("/history")
+    def history(limit: int = 100):
+        return {"jobs": get_history(limit)}
+
+    @app.get("/stats")
+    def stats():
+        return get_stats()
+
+    @app.get("/logs/{job_id}")
+    def logs(job_id: str):
+        import glob as _glob
+        matches = _glob.glob(f"/tmp/slurm_*_{job_id}.out")
+        if not matches:
+            return {"job_id": job_id, "log": f"(no log file found for job {job_id})"}
+        log_path = matches[0]
+        try:
+            content = Path(log_path).read_text(errors="replace")
+            return {"job_id": job_id, "file": log_path, "log": content}
+        except Exception as e:
+            return {"job_id": job_id, "log": f"Error reading log: {e}"}
 
     @app.get("/cluster")
     def cluster():
@@ -673,11 +957,12 @@ def run_http_server(port: int = 8765):
                     "desc": "提交 job",
                     "body": {
                         "command": "要執行的指令 (必填), e.g. 'python3 -u train.py --lr 0.001'",
+                        "username": "使用者名稱 (必填), e.g. 'alice' → repo 放在 /storage/SSD2/slurmjob/alice/",
                         "gpu": "GPU 數量 (預設 1)",
                         "job_name": "job 名稱 (預設 job)",
                         "nodelist": "指定節點 (選填)",
                         "branch": "git branch (預設 main)",
-                        "repo_dir": "repo 路徑 (選填, 預設 /storage/SSD2/hank/gpu_training)",
+                        "repo_dir": "repo 路徑 (選填, 必須在 /storage/SSD2/slurmjob/<username>/ 底下)",
                         "repo_url": "git remote URL (選填)",
                     }
                 },
