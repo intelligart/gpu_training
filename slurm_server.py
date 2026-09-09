@@ -13,10 +13,13 @@ Slurm MCP + HTTP Server
 
 import subprocess
 import os
+import re
 import argparse
 import tempfile
 import shlex
 import sqlite3
+import socket
+import threading
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -31,13 +34,28 @@ GENERATED_SCRIPTS_DIR = Path("/tmp/slurm-generated")
 
 ENV = {**os.environ, "SLURM_CONF": SLURM_CONF}
 
-# Per-node venv activation (維護在這裡，不用每個 script 各自寫)
-VENV_ACTIVATE = """
-case "$SLURMD_NODENAME" in
-    ia-ai-server-5) source /storage/SSD2/hank/ComfyUI/venv/bin/activate ;;
-    ia-ai-server-4|AI-Server-6) source /storage/SSD2/hank/gpu_training/venv/bin/activate ;;
-esac
-"""
+# Shared venvs on NAS — 放在這個目錄下的子目錄會自動被偵測為可用 venv
+VENVS_BASE = Path("/storage/Internal_NAS/venvs")
+
+def get_available_venvs() -> list[dict]:
+    """掃描 VENVS_BASE 下的目錄，自動偵測可用 venvs"""
+    venvs = []
+    if VENVS_BASE.exists():
+        for d in sorted(VENVS_BASE.iterdir()):
+            if d.is_dir():
+                activate = d / "bin" / "activate"
+                venvs.append({"name": d.name, "path": str(d), "exists": activate.exists()})
+    return venvs
+
+def resolve_venv(venv: str) -> str:
+    """解析 venv 名稱或路徑，回傳完整路徑"""
+    if not venv:
+        return ""
+    # 如果已經是絕對路徑，直接回傳
+    if venv.startswith("/"):
+        return venv
+    # 當作 VENVS_BASE 下的名稱，組成完整路徑
+    return str(VENVS_BASE / venv)
 
 DEFAULT_REPO_DIR = "/storage/SSD2/hank/gpu_training"
 SLURMJOB_BASE = Path("/storage/SSD2/slurmjob")
@@ -146,18 +164,25 @@ def generate_script(
     work_dir = repo_dir or DEFAULT_REPO_DIR
 
     if venv:
-        venv_activate = f"source {venv}/bin/activate"
+        venv_path = resolve_venv(venv)
+        venv_activate = f"source {venv_path}/bin/activate"
     else:
-        venv_activate = VENV_ACTIVATE
+        venv_activate = "# no venv specified"
 
     if repo_url:
+        if branch == "main":
+            # Auto-detect default branch from remote
+            branch_cmd = "BRANCH=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p'); BRANCH=${BRANCH:-main}"
+        else:
+            branch_cmd = f"BRANCH={branch}"
         git_sync = f"""
 if [ ! -d "{work_dir}/.git" ]; then
     git clone {repo_url} {work_dir}
 fi
 cd {work_dir}
 git config --local --add safe.directory '{work_dir}'
-flock -w 60 .git/config sh -c 'git fetch origin && git checkout {branch} && git pull origin {branch}'
+{branch_cmd}
+flock -w 60 .git/config sh -c "git fetch origin && git checkout $BRANCH && git pull origin $BRANCH"
 """
     else:
         git_sync = f"""
@@ -171,7 +196,6 @@ flock -w 60 .git/config git pull origin {branch}
 #SBATCH --gres=gpu:{gpu}
 #SBATCH --cpus-per-task=4
 #SBATCH --output=/tmp/slurm_{job_name}_%j.out
-#SBATCH --time=02:00:00
 {nodelist_line}
 {mem_line}
 {venv_activate}
@@ -278,6 +302,132 @@ def get_gpu_alloc() -> dict:
     }
 
 
+def _get_node_gpu_status(node: str) -> list[dict]:
+    """SSH into a node and query nvidia-smi for GPU details."""
+    hostname = socket.gethostname()
+    is_local = (node == hostname or node == hostname.split('.')[0])
+
+    nvidia_cmd = "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
+    proc_cmd = "nvidia-smi --query-compute-apps=gpu_bus_id,pid,process_name,used_memory --format=csv,noheader,nounits"
+    bus_cmd = "nvidia-smi --query-gpu=index,gpu_bus_id --format=csv,noheader"
+
+    if is_local:
+        shell_cmd = f"{nvidia_cmd} && echo '---PROCS---' && {proc_cmd} && echo '---BUS---' && {bus_cmd}"
+    else:
+        shell_cmd = f"ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {node} \"{nvidia_cmd} && echo '---PROCS---' && {proc_cmd} && echo '---BUS---' && {bus_cmd}\""
+
+    try:
+        result = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=8)
+        if result.returncode != 0:
+            return []
+    except (subprocess.TimeoutExpired, Exception):
+        return []
+
+    output = result.stdout.strip()
+    parts = output.split('---PROCS---')
+    gpu_section = parts[0].strip()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    bus_parts = rest.split('---BUS---')
+    proc_section = bus_parts[0].strip()
+    bus_section = bus_parts[1].strip() if len(bus_parts) > 1 else ""
+
+    # Parse bus_id to index mapping
+    bus_to_idx = {}
+    for line in bus_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 2:
+            bus_to_idx[cols[1]] = int(cols[0])
+
+    # Collect all PIDs from proc section, then batch-query usernames via ps
+    all_pids = set()
+    for line in proc_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 4:
+            all_pids.add(cols[1].strip())
+
+    pid_to_user = {}
+    if all_pids:
+        ps_cmd_str = f"ps -o pid=,user= -p {','.join(all_pids)}"
+        if is_local:
+            ps_shell = ps_cmd_str
+        else:
+            ps_shell = f"ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {node} \"{ps_cmd_str}\""
+        try:
+            ps_result = subprocess.run(ps_shell, shell=True, capture_output=True, text=True, timeout=5)
+            for line in ps_result.stdout.strip().splitlines():
+                fields = line.strip().split()
+                if len(fields) >= 2:
+                    pid_to_user[fields[0]] = fields[1]
+        except Exception:
+            pass
+
+    # Parse processes
+    gpu_procs: dict[int, list[dict]] = {}
+    for line in proc_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 4:
+            bus_id = cols[0]
+            idx = bus_to_idx.get(bus_id, -1)
+            pid = cols[1].strip()
+            proc_name = cols[2].split('/')[-1]  # just the binary name
+            user = pid_to_user.get(pid, "")
+            mem = int(cols[3]) if cols[3].strip().isdigit() else 0
+            if idx not in gpu_procs:
+                gpu_procs[idx] = []
+            gpu_procs[idx].append({"name": proc_name, "user": user, "mem_mb": mem})
+
+    # Parse GPU info
+    gpus = []
+    for line in gpu_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 5:
+            idx = int(cols[0])
+            procs = gpu_procs.get(idx, [])
+            # Summarize processes: "user/process (XXXMB)"
+            proc_summary = ", ".join(
+                f"{p['user']}/{p['name']} ({p['mem_mb']}MB)" if p['user'] else f"{p['name']} ({p['mem_mb']}MB)"
+                for p in sorted(procs, key=lambda x: -x['mem_mb'])
+            ) if procs else ""
+            gpus.append({
+                "index": idx,
+                "name": cols[1],
+                "mem_used_mb": int(cols[2]),
+                "mem_total_mb": int(cols[3]),
+                "util_pct": int(cols[4]),
+                "processes": proc_summary,
+            })
+    return gpus
+
+
+def get_gpu_status() -> dict:
+    """Get real-time GPU status from all cluster nodes via nvidia-smi."""
+    # Get node list from sinfo
+    stdout, _, rc = run_cmd([SINFO, "-N", "-o", "%N %T", "--noheader"])
+    nodes = {}
+    if rc == 0:
+        for line in stdout.splitlines():
+            parts = line.split()
+            if parts:
+                nodes[parts[0]] = parts[1] if len(parts) > 1 else "unknown"
+
+    # Query all nodes in parallel
+    results = {}
+    lock = threading.Lock()
+
+    def query_node(node, state):
+        gpus = _get_node_gpu_status(node)
+        with lock:
+            results[node] = {"state": state, "gpus": gpus}
+
+    threads = [threading.Thread(target=query_node, args=(n, s)) for n, s in nodes.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    return results
+
+
 def get_queue(user: Optional[str] = None) -> str:
     """查看 job queue"""
     cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %10b %N %v"]
@@ -343,9 +493,9 @@ def list_scripts() -> list[str]:
 # ─── MCP Server ───────────────────────────────────────────────────────────────
 
 def run_mcp_server():
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
-    mcp = FastMCP("Slurm Manager")
+    mcp = MCPServer("Slurm Manager")
 
     @mcp.tool()
     def slurm_submit(
@@ -503,6 +653,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
     .stat-row { margin-top: 10px; font-size: 12px; color: #64748b; display: flex; justify-content: space-between; border-top: 1px solid #2d3148; padding-top: 8px; }
 
+    /* GPU status table */
+    .gpu-util-bar { display: inline-block; width: 60px; height: 6px; background: #0f1117; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
+    .gpu-util-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #22c55e, #4ade80); }
+    .gpu-util-fill.high { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+    .gpu-util-fill.critical { background: linear-gradient(90deg, #dc2626, #f87171); }
+    .vram-text { font-size: 12px; color: #94a3b8; }
+    .vram-text .used { color: #a78bfa; font-weight: 600; }
+    .proc-text { font-size: 11px; color: #64748b; }
+    .gpu-node-offline { color: #475569; font-style: italic; }
+
     /* Log modal */
     .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
     .modal-backdrop.show { display: flex; }
@@ -526,6 +686,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div>
       <div class="section-title">Cluster Nodes</div>
       <div class="cluster-grid" id="cluster-grid"><div class="node-card"><div class="node-name" style="color:#475569">Loading...</div></div></div>
+    </div>
+
+    <div>
+      <div class="section-title">GPU Status (Real-time)</div>
+      <div class="queue-wrap">
+        <table>
+          <thead><tr><th>Node</th><th>GPU</th><th>Model</th><th>VRAM Usage</th><th>Utilization</th><th>Processes</th></tr></thead>
+          <tbody id="gpu-status-body"><tr><td colspan="6" class="empty-state">Loading...</td></tr></tbody>
+        </table>
+      </div>
     </div>
 
     <div>
@@ -594,8 +764,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <input id="f-repourl" type="text" placeholder="git@github.com:org/repo.git">
           </div>
           <div class="form-full">
-            <label>Venv Path (optional)</label>
-            <input id="f-venv" type="text" placeholder="/storage/SSD2/alice/venv">
+            <label>Venv</label>
+            <select id="f-venv" onchange="toggleCustomVenv()">
+              <option value="">-- None (no venv) --</option>
+            </select>
+            <input id="f-venv-custom" type="text" placeholder="/storage/SSD2/alice/venv" style="display:none;margin-top:6px">
           </div>
         </div>
         <button class="btn-submit" id="btn-submit" onclick="submitJob()">Submit Job</button>
@@ -717,18 +890,79 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } catch(e) {}
     }
 
+    function toggleCustomVenv() {
+      const sel = document.getElementById('f-venv');
+      const custom = document.getElementById('f-venv-custom');
+      custom.style.display = sel.value === '__custom__' ? 'block' : 'none';
+      if (sel.value !== '__custom__') custom.value = '';
+    }
+
+    function getVenvValue() {
+      const sel = document.getElementById('f-venv');
+      if (sel.value === '__custom__') return document.getElementById('f-venv-custom').value.trim();
+      return sel.value;
+    }
+
+    async function loadVenvs() {
+      try {
+        const res = await fetch('/venvs');
+        const data = await res.json();
+        const sel = document.getElementById('f-venv');
+        (data.venvs || []).forEach(v => {
+          const opt = document.createElement('option');
+          opt.value = v.name;
+          opt.textContent = v.name + (v.exists ? '' : ' (missing)');
+          sel.appendChild(opt);
+        });
+        const custom = document.createElement('option');
+        custom.value = '__custom__';
+        custom.textContent = 'Custom path...';
+        sel.appendChild(custom);
+      } catch(e) {}
+    }
+
+    function renderGpuStatus(data) {
+      let rows = '';
+      const nodeNames = Object.keys(data).sort();
+      for (const node of nodeNames) {
+        const info = data[node];
+        if (!info.gpus || info.gpus.length === 0) {
+          rows += `<tr><td style="color:#c4b5fd;font-weight:600">${node}</td><td colspan="5" class="gpu-node-offline">${info.state === 'down' || info.state === 'down*' ? 'Node down' : 'No GPU data'}</td></tr>`;
+          continue;
+        }
+        info.gpus.forEach((gpu, i) => {
+          const memPct = gpu.mem_total_mb > 0 ? Math.round(gpu.mem_used_mb / gpu.mem_total_mb * 100) : 0;
+          const memUsedGB = (gpu.mem_used_mb / 1024).toFixed(1);
+          const memTotalGB = (gpu.mem_total_mb / 1024).toFixed(0);
+          const utilClass = gpu.util_pct > 80 ? 'critical' : gpu.util_pct > 40 ? 'high' : '';
+          rows += `<tr>
+            <td style="color:#c4b5fd;font-weight:600">${i === 0 ? node : ''}</td>
+            <td style="color:#94a3b8">GPU ${gpu.index}</td>
+            <td style="color:#e2e8f0">${gpu.name}</td>
+            <td><span class="vram-text"><span class="used">${memUsedGB}</span> / ${memTotalGB} GB</span></td>
+            <td><div class="gpu-util-bar"><div class="gpu-util-fill ${utilClass}" style="width:${gpu.util_pct}%"></div></div> ${gpu.util_pct}%</td>
+            <td class="proc-text">${gpu.processes || '—'}</td>
+          </tr>`;
+        });
+      }
+      document.getElementById('gpu-status-body').innerHTML = rows || '<tr><td colspan="6" class="empty-state">No nodes found</td></tr>';
+    }
+
     async function refresh() {
       try {
-        const [clusterRes, queueRes, gpuRes] = await Promise.all([
-          fetch('/cluster'), fetch('/queue'), fetch('/gpu-alloc')
+        const [clusterRes, queueRes, gpuRes, gpuStatusRes] = await Promise.all([
+          fetch('/cluster'), fetch('/queue'), fetch('/gpu-alloc'), fetch('/gpu-status')
         ]);
         const clusterData = await clusterRes.json();
         const queueData = await queueRes.json();
         const gpuData = await gpuRes.json();
+        const gpuStatusData = await gpuStatusRes.json();
 
         const nodes = parseCluster(clusterData.output || '');
         document.getElementById('cluster-grid').innerHTML =
           nodes.length ? nodes.map(n => nodeCardHTML(n, gpuData)).join('') : '<div style="color:#475569;padding:16px">No nodes found</div>';
+
+        renderGpuStatus(gpuStatusData);
 
         const jobs = queueData.jobs || [];
         document.getElementById('queue-body').innerHTML =
@@ -762,7 +996,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             nodelist: document.getElementById('f-nodelist').value,
             repo_dir: document.getElementById('f-repodir').value,
             repo_url: document.getElementById('f-repourl').value,
-            venv: document.getElementById('f-venv').value,
+            venv: getVenvValue(),
           })
         });
         const data = await res.json();
@@ -817,6 +1051,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     refresh();
     refreshStats();
+    loadVenvs();
     setInterval(refresh, 5000);
     setInterval(refreshStats, 30000);
   </script>
@@ -939,6 +1174,35 @@ def run_http_server(port: int = 8765):
     @app.get("/gpu-alloc")
     def gpu_alloc():
         return get_gpu_alloc()
+
+    @app.get("/gpu-status")
+    def gpu_status():
+        return get_gpu_status()
+
+    @app.get("/venvs")
+    def venvs():
+        return {"venvs": get_available_venvs()}
+
+    class CreateVenvRequest(BaseModel):
+        name: str
+        python_version: str = ""
+
+    @app.post("/venvs/create")
+    def create_venv(req: CreateVenvRequest):
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', req.name):
+            raise HTTPException(status_code=400, detail="Invalid venv name: use only letters, numbers, _ or -")
+        venv_path = VENVS_BASE / req.name
+        if venv_path.exists():
+            raise HTTPException(status_code=400, detail=f"Venv '{req.name}' already exists at {venv_path}")
+        python = req.python_version or "python3"
+        result = subprocess.run(
+            [python, "-m", "venv", str(venv_path)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=result.stderr)
+        return {"success": True, "name": req.name, "path": str(venv_path)}
 
     @app.get("/scripts")
     def scripts():
