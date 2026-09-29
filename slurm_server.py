@@ -15,11 +15,16 @@ import subprocess
 import os
 import re
 import argparse
+import json
 import tempfile
 import shlex
 import sqlite3
 import socket
 import threading
+import uuid
+import fcntl
+import hashlib
+import shutil
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -31,8 +36,13 @@ SCANCEL = "/usr/bin/scancel"
 SINFO = "/usr/bin/sinfo"
 JOBS_DIR = Path("/home/hank/Code/slurm-jobs")
 GENERATED_SCRIPTS_DIR = Path("/tmp/slurm-generated")
+NAS_LOGS_DIR = Path("/storage/Internal_NAS/logs")
+SOURCE_CACHE_BASE = Path("/storage/Internal_NAS/slurm-source-cache")
+RUNS_BASE = Path("/storage/Internal_NAS/slurm-runs")
+RECOVERY_DIR = Path("/storage/Internal_NAS/slurm-recovery")
 
 ENV = {**os.environ, "SLURM_CONF": SLURM_CONF}
+SERVICE_VERSION = os.environ.get("GPU_PLATFORM_VERSION", "development")
 
 # Shared venvs on NAS — 放在這個目錄下的子目錄會自動被偵測為可用 venv
 VENVS_BASE = Path("/storage/Internal_NAS/venvs")
@@ -61,38 +71,192 @@ DEFAULT_REPO_DIR = "/storage/SSD2/hank/gpu_training"
 SLURMJOB_BASE = Path("/storage/SSD2/slurmjob")
 DB_PATH = Path("/storage/SSD2/hank/gpu_training/slurm_history.db")
 
+SUBMISSION_COLUMNS = {
+  "submission_id": "TEXT",
+  "source_identity": "TEXT DEFAULT ''",
+  "source_commit": "TEXT DEFAULT ''",
+  "run_path": "TEXT DEFAULT ''",
+  "script_path": "TEXT DEFAULT ''",
+  "log_path": "TEXT DEFAULT ''",
+  "request_payload": "TEXT DEFAULT ''",
+  "status": "TEXT DEFAULT 'legacy'",
+  "submission_source": "TEXT DEFAULT 'legacy'",
+}
+
+
+def _connect_db() -> sqlite3.Connection:
+  conn = sqlite3.connect(DB_PATH, timeout=5)
+  conn.execute("PRAGMA busy_timeout = 5000")
+  return conn
+
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id TEXT,
-            username TEXT,
-            job_name TEXT,
-            command TEXT,
-            gpu INTEGER,
-            nodelist TEXT,
-            repo_dir TEXT,
-            repo_url TEXT,
-            branch TEXT,
-            submit_time TEXT
-        )
-    """)
-    conn.commit()
+    conn = _connect_db()
+    try:
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id TEXT,
+                    job_id TEXT,
+                    username TEXT,
+                    job_name TEXT,
+                    command TEXT,
+                    gpu INTEGER,
+                    nodelist TEXT,
+                    repo_dir TEXT,
+                    repo_url TEXT,
+                    branch TEXT,
+                    source_identity TEXT DEFAULT '',
+                    source_commit TEXT DEFAULT '',
+                    run_path TEXT DEFAULT '',
+                    script_path TEXT DEFAULT '',
+                    log_path TEXT DEFAULT '',
+                    request_payload TEXT DEFAULT '',
+                    status TEXT DEFAULT 'legacy',
+                    submission_source TEXT DEFAULT 'legacy',
+                    submit_time TEXT
+                )
+                """
+            )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+            for column, declaration in SUBMISSION_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS jobs_submission_id_unique
+                ON jobs(submission_id)
+                WHERE submission_id IS NOT NULL
+                """
+            )
+    finally:
+        conn.close()
+
+
+def record_submission(
+  *,
+  submission_id: Optional[str],
+  job_id: Optional[str],
+  username: str,
+  job_name: str,
+  command: str,
+  gpu: int,
+  nodelist: str = "",
+  repo_dir: str = "",
+  repo_url: str = "",
+  branch: str = "main",
+  source_identity: str = "",
+  source_commit: str = "",
+  run_path: str = "",
+  script_path: str = "",
+  log_path: str = "",
+  request_payload: str = "",
+  status: str = "submitted",
+  submission_source: str = "legacy",
+) -> None:
+  conn = _connect_db()
+  try:
+    with conn:
+      conn.execute(
+        """
+        INSERT INTO jobs (
+          submission_id, job_id, username, job_name, command, gpu,
+          nodelist, repo_dir, repo_url, branch, source_identity,
+          source_commit, run_path, script_path, log_path,
+          request_payload, status, submission_source, submit_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+          submission_id or None,
+          job_id,
+          username,
+          job_name,
+          command,
+          gpu,
+          nodelist,
+          repo_dir,
+          repo_url,
+          branch,
+          source_identity,
+          source_commit,
+          run_path,
+          script_path,
+          log_path,
+          request_payload,
+          status,
+          submission_source,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+      )
+  finally:
     conn.close()
 
 
 def record_job(job_id: str, username: str, job_name: str, command: str,
-               gpu: int, nodelist: str, repo_dir: str, repo_url: str, branch: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT INTO jobs (job_id, username, job_name, command, gpu, nodelist, repo_dir, repo_url, branch, submit_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (job_id, username, job_name, command, gpu, nodelist, repo_dir, repo_url, branch,
-          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
+               gpu: int, nodelist: str, repo_dir: str, repo_url: str, branch: str,
+               submission_source: str = "legacy"):
+  record_submission(
+    submission_id=None,
+    job_id=job_id,
+    username=username,
+    job_name=job_name,
+    command=command,
+    gpu=gpu,
+    nodelist=nodelist,
+    repo_dir=repo_dir,
+    repo_url=repo_url,
+    branch=branch,
+    submission_source=submission_source,
+  )
+
+
+def get_submission(submission_id: str) -> Optional[dict]:
+  conn = _connect_db()
+  conn.row_factory = sqlite3.Row
+  try:
+    row = conn.execute(
+      "SELECT * FROM jobs WHERE submission_id = ?", (submission_id,)
+    ).fetchone()
+    return dict(row) if row else None
+  finally:
     conn.close()
+
+
+def get_submission_by_job_id(job_id: str) -> Optional[dict]:
+  conn = _connect_db()
+  conn.row_factory = sqlite3.Row
+  try:
+    row = conn.execute(
+      "SELECT * FROM jobs WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+      (job_id,),
+    ).fetchone()
+    return dict(row) if row else None
+  finally:
+    conn.close()
+
+
+def write_recovery_record(record: dict) -> str:
+  RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+  recovery_path = RECOVERY_DIR / f"{record['submission_id']}.json"
+  file_descriptor, temporary_name = tempfile.mkstemp(
+    dir=RECOVERY_DIR,
+    prefix=f".{record['submission_id']}-",
+    suffix=".tmp",
+    text=True,
+  )
+  temporary_path = Path(temporary_name)
+  try:
+    with os.fdopen(file_descriptor, "w") as stream:
+      json.dump(record, stream, sort_keys=True)
+      stream.write("\n")
+      stream.flush()
+      os.fsync(stream.fileno())
+    os.replace(temporary_path, recovery_path)
+  finally:
+    temporary_path.unlink(missing_ok=True)
+  return str(recovery_path)
 
 
 def get_history(limit: int = 100) -> list[dict]:
@@ -105,14 +269,89 @@ def get_history(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def cleanup_old_jobs(days: int = 30):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "DELETE FROM jobs WHERE submit_time < datetime('now', ?)",
-        (f"-{days} days",)
-    )
-    conn.commit()
+class SlurmStatusError(RuntimeError):
+  pass
+
+
+def get_active_job_ids() -> set[str]:
+  stdout, stderr, return_code = run_cmd(
+    [SQUEUE, "-h", "-t", "PENDING,RUNNING,CONFIGURING,COMPLETING", "-o", "%i"]
+  )
+  if return_code != 0:
+    raise SlurmStatusError(stderr or "Unable to query active Slurm jobs")
+  return {line.strip() for line in stdout.splitlines() if line.strip()}
+
+
+def list_cleanup_candidates(days: int = 30) -> list[dict]:
+  active_job_ids = get_active_job_ids()
+  conn = _connect_db()
+  conn.row_factory = sqlite3.Row
+  try:
+    rows = conn.execute(
+      "SELECT * FROM jobs WHERE submit_time < datetime('now', ?)",
+      (f"-{days} days",),
+    ).fetchall()
+  finally:
     conn.close()
+
+  candidates = []
+  for row in rows:
+    candidate = dict(row)
+    candidate["active"] = bool(
+      candidate.get("job_id") and candidate["job_id"] in active_job_ids
+    )
+    candidate["cleanup_eligible"] = not candidate["active"]
+    candidates.append(candidate)
+  return candidates
+
+
+def _remove_managed_artifact(path_value: str, allowed_root: Path) -> None:
+  if not path_value:
+    return
+  artifact_path = Path(path_value).resolve()
+  root_path = allowed_root.resolve()
+  try:
+    artifact_path.relative_to(root_path)
+  except ValueError as exc:
+    raise ValueError(f"Refusing to remove unmanaged artifact: {artifact_path}") from exc
+
+  if artifact_path.is_dir():
+    shutil.rmtree(artifact_path)
+  else:
+    artifact_path.unlink(missing_ok=True)
+
+
+def cleanup_old_jobs(days: int = 30, dry_run: bool = True) -> dict:
+  candidates = list_cleanup_candidates(days)
+  eligible = [candidate for candidate in candidates if candidate["cleanup_eligible"]]
+  skipped_active = [candidate for candidate in candidates if candidate["active"]]
+  if dry_run:
+    return {
+      "dry_run": True,
+      "eligible": eligible,
+      "skipped_active": skipped_active,
+      "deleted": [],
+    }
+
+  deleted = []
+  for candidate in eligible:
+    _remove_managed_artifact(candidate.get("run_path", ""), RUNS_BASE)
+    _remove_managed_artifact(candidate.get("script_path", ""), GENERATED_SCRIPTS_DIR)
+    _remove_managed_artifact(candidate.get("log_path", ""), NAS_LOGS_DIR)
+    conn = _connect_db()
+    try:
+      with conn:
+        conn.execute("DELETE FROM jobs WHERE id = ?", (candidate["id"],))
+    finally:
+      conn.close()
+    deleted.append(candidate)
+
+  return {
+    "dry_run": False,
+    "eligible": eligible,
+    "skipped_active": skipped_active,
+    "deleted": deleted,
+  }
 
 
 def get_stats() -> dict:
@@ -136,13 +375,134 @@ def get_stats() -> dict:
     return stats
 
 
-init_db()
-cleanup_old_jobs(days=30)
-
-
 def run_cmd(cmd: list[str]) -> tuple[str, str, int]:
     result = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
     return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+
+class SourcePreparationError(RuntimeError):
+  pass
+
+
+def _run_source_command(command: list[str]) -> str:
+  result = subprocess.run(command, capture_output=True, text=True, env=ENV)
+  if result.returncode != 0:
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
+    raise SourcePreparationError(detail)
+  return result.stdout.strip()
+
+
+def _resolve_source_commit(cache_path: Path, requested_ref: str) -> str:
+  candidates = [
+    f"refs/remotes/origin/{requested_ref}",
+    f"refs/heads/{requested_ref}",
+    requested_ref,
+  ]
+  if requested_ref == "main":
+    candidates.append("HEAD")
+  for candidate in candidates:
+    result = subprocess.run(
+      ["git", "--git-dir", str(cache_path), "rev-parse", "--verify", f"{candidate}^{{commit}}"],
+      capture_output=True,
+      text=True,
+      env=ENV,
+    )
+    if result.returncode == 0:
+      return result.stdout.strip()
+  raise SourcePreparationError(f"Unable to resolve source ref: {requested_ref}")
+
+
+def prepare_submission_source(
+  *,
+  submission_id: str,
+  username: str,
+  branch: str,
+  repo_dir: str = "",
+  repo_url: str = "",
+) -> dict[str, str]:
+  source_identity = repo_url or repo_dir or DEFAULT_REPO_DIR
+  cache_key = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
+  cache_path = SOURCE_CACHE_BASE / username / f"{cache_key}.git"
+  lock_path = SOURCE_CACHE_BASE / username / ".locks" / f"{cache_key}.lock"
+  run_path = RUNS_BASE / username / submission_id
+  temporary_run_path = run_path.with_name(f".{submission_id}.{uuid.uuid4().hex}.tmp")
+
+  lock_path.parent.mkdir(parents=True, exist_ok=True)
+  run_path.parent.mkdir(parents=True, exist_ok=True)
+  if run_path.exists():
+    raise SourcePreparationError(f"Run directory already exists: {run_path}")
+
+  try:
+    with lock_path.open("a+") as lock_file:
+      fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+      if cache_path.exists():
+        _run_source_command(
+          ["git", "--git-dir", str(cache_path), "remote", "set-url", "origin", source_identity]
+        )
+        _run_source_command(
+          ["git", "--git-dir", str(cache_path), "fetch", "--prune", "origin"]
+        )
+      else:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_source_command(
+          ["git", "clone", "--mirror", "--", source_identity, str(cache_path)]
+        )
+
+      source_commit = _resolve_source_commit(cache_path, branch)
+      _run_source_command(
+        [
+          "git",
+          "clone",
+          "--no-hardlinks",
+          "--no-checkout",
+          "--",
+          str(cache_path),
+          str(temporary_run_path),
+        ]
+      )
+      _run_source_command(
+        ["git", "-C", str(temporary_run_path), "checkout", "--detach", source_commit]
+      )
+      _run_source_command(
+        ["git", "-C", str(temporary_run_path), "remote", "remove", "origin"]
+      )
+      os.replace(temporary_run_path, run_path)
+  except (OSError, SourcePreparationError):
+    shutil.rmtree(temporary_run_path, ignore_errors=True)
+    raise
+
+  return {
+    "source_identity": source_identity,
+    "source_commit": source_commit,
+    "run_path": str(run_path),
+  }
+
+
+def get_submission_artifact_paths(submission_id: str, username: str) -> dict[str, Path]:
+  script_path = GENERATED_SCRIPTS_DIR / submission_id / "job.sh"
+  log_root = NAS_LOGS_DIR / username if username else NAS_LOGS_DIR
+  log_path = log_root / submission_id / "slurm_%j.out"
+  return {"script_path": script_path, "log_path": log_path}
+
+
+def _write_script_atomic(script_path: Path, content: str) -> None:
+  script_path.parent.mkdir(parents=True, exist_ok=False)
+  file_descriptor, temporary_name = tempfile.mkstemp(
+    dir=script_path.parent,
+    prefix=".job-",
+    suffix=".tmp",
+    text=True,
+  )
+  temporary_path = Path(temporary_name)
+  try:
+    with os.fdopen(file_descriptor, "w") as stream:
+      stream.write(content)
+      stream.flush()
+      os.fsync(stream.fileno())
+    temporary_path.chmod(0o755)
+    os.replace(temporary_path, script_path)
+  finally:
+    temporary_path.unlink(missing_ok=True)
 
 
 def generate_script(
@@ -155,13 +515,28 @@ def generate_script(
     repo_url: str = "",
     mem: str = "",
     venv: str = "",
+    username: str = "",
+    submission_id: Optional[str] = None,
+    run_dir: str = "",
 ) -> Path:
     """動態產生 sbatch script，回傳路徑"""
-    GENERATED_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    submission_id = submission_id or uuid.uuid4().hex
+    artifact_paths = get_submission_artifact_paths(submission_id, username)
+    script_path = artifact_paths["script_path"]
+    log_path = artifact_paths["log_path"]
+    log_path.parent.mkdir(parents=True, exist_ok=False)
 
     nodelist_line = f"#SBATCH --nodelist={nodelist}" if nodelist else ""
     mem_line = f"#SBATCH --mem={mem}" if mem else ""
-    work_dir = repo_dir or DEFAULT_REPO_DIR
+
+    # 決定 work_dir：優先用 repo_dir，否則從 repo_url 推斷，最後 fallback DEFAULT_REPO_DIR
+    if repo_dir:
+        work_dir = repo_dir
+    elif repo_url and username:
+        repo_name = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
+        work_dir = str(SLURMJOB_BASE / username / repo_name)
+    else:
+        work_dir = DEFAULT_REPO_DIR
 
     if venv:
         venv_path = resolve_venv(venv)
@@ -169,7 +544,9 @@ def generate_script(
     else:
         venv_activate = "# no venv specified"
 
-    if repo_url:
+    if run_dir:
+      git_sync = f"\ncd {shlex.quote(run_dir)}\n"
+    elif repo_url:
         if branch == "main":
             # Auto-detect default branch from remote
             branch_cmd = "BRANCH=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p'); BRANCH=${BRANCH:-main}"
@@ -195,7 +572,7 @@ flock -w 60 .git/config git pull origin {branch}
 #SBATCH --job-name={job_name}
 #SBATCH --gres=gpu:{gpu}
 #SBATCH --cpus-per-task=4
-#SBATCH --output=/tmp/slurm_{job_name}_%j.out
+#SBATCH --output={str(log_path)}
 {nodelist_line}
 {mem_line}
 {venv_activate}
@@ -203,10 +580,7 @@ flock -w 60 .git/config git pull origin {branch}
 {command}
 """
 
-    # 用 job_name 命名，方便識別
-    script_path = GENERATED_SCRIPTS_DIR / f"{job_name}.sh"
-    script_path.write_text(script)
-    script_path.chmod(0o755)
+    _write_script_atomic(script_path, script)
     return script_path
 
 
@@ -221,17 +595,51 @@ def submit_job(
     repo_url: str = "",
     mem: str = "",
     venv: str = "",
+    username: str = "",
 ) -> dict:
     """提交 sbatch job。可指定現有 script_path 或直接給 command 動態產生"""
+    submission_id = uuid.uuid4().hex
+    source_metadata: dict[str, str] = {}
     if command:
         name = job_name or "job"
-        path = generate_script(command, gpu=gpu, job_name=name, nodelist=nodelist, branch=branch, repo_dir=repo_dir, repo_url=repo_url, mem=mem, venv=venv)
+        try:
+            source_metadata = prepare_submission_source(
+                submission_id=submission_id,
+                username=username,
+                branch=branch,
+                repo_dir=repo_dir,
+                repo_url=repo_url,
+            )
+            path = generate_script(
+                command,
+                gpu=gpu,
+                job_name=name,
+                nodelist=nodelist,
+                branch=branch,
+                repo_dir=repo_dir,
+                repo_url=repo_url,
+                mem=mem,
+                venv=venv,
+                username=username,
+                submission_id=submission_id,
+                run_dir=source_metadata["run_path"],
+            )
+        except (OSError, SourcePreparationError) as exc:
+            return {
+                "success": False,
+                "submission_id": submission_id,
+                "error": f"Source preparation failed: {exc}",
+            }
     elif script_path:
         if not Path(script_path).exists():
-            return {"success": False, "error": f"Script not found: {script_path}"}
+            return {
+                "success": False,
+                "submission_id": submission_id,
+                "error": f"Script not found: {script_path}",
+            }
         path = Path(script_path)
     else:
-        return {"success": False, "error": "Must provide either command or script_path"}
+        return {"success": False, "submission_id": submission_id, "error": "Must provide either command or script_path"}
 
     cmd = [SBATCH]
     if gpu and not command:  # command 模式已寫在 script 裡
@@ -245,8 +653,18 @@ def submit_job(
     stdout, stderr, rc = run_cmd(cmd)
     if rc == 0:
         job_id = stdout.split()[-1]
-        return {"success": True, "job_id": job_id, "message": stdout, "script": str(path)}
-    return {"success": False, "error": stderr}
+        log_path = get_submission_artifact_paths(submission_id, username)["log_path"]
+        return {
+            "success": True,
+            "submission_id": submission_id,
+            "job_id": job_id,
+            "message": stdout,
+            "script": str(path),
+            "script_path": str(path),
+            "log_path": str(log_path).replace("%j", job_id),
+            **source_metadata,
+        }
+    return {"success": False, "submission_id": submission_id, "error": stderr}
 
 
 def parse_queue_output(stdout: str) -> list[dict]:
@@ -493,6 +911,8 @@ def list_scripts() -> list[str]:
 # ─── MCP Server ───────────────────────────────────────────────────────────────
 
 def run_mcp_server():
+    raise RuntimeError("Embedded MCP is disabled; run mcp_server.py instead")
+
     from mcp.server.mcpserver import MCPServer
 
     mcp = MCPServer("Slurm Manager")
@@ -986,7 +1406,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       try {
         const res = await fetch('/submit', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Submission-Source': 'internal-ui'
+          },
           body: JSON.stringify({
             command,
             username,
@@ -1059,15 +1482,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </html>"""
 
 
-def run_http_server(port: int = 8765):
-    from fastapi import FastAPI, HTTPException
+def create_http_app():
+    from fastapi import FastAPI, Header, HTTPException
     from fastapi.responses import HTMLResponse
-    from pydantic import BaseModel
-    import uvicorn
+    from pydantic import BaseModel, ConfigDict
 
     app = FastAPI(title="Slurm API", description="Submit and manage Slurm jobs")
 
     class SubmitRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
         command: str                  # e.g. "python3 -u train.py --lr 0.001"
         username: str                 # e.g. "alice" — determines /storage/SSD2/slurmjob/<username>/
         gpu: int = 1
@@ -1078,14 +1502,33 @@ def run_http_server(port: int = 8765):
         repo_url: str = ""           # e.g. "git@github.com:org/repo.git"
         mem: str = ""                # e.g. "32G", "16G" (預設用 DefMemPerCPU)
         venv: str = ""               # e.g. "/storage/SSD2/alice/venv"
-        script_path: str = ""        # legacy: 直接指定現有 script
 
     @app.post("/submit")
-    def submit(req: SubmitRequest):
-        if not req.username:
-            raise HTTPException(status_code=400, detail="username is required")
+    def submit(
+        req: SubmitRequest,
+        submission_source: str = Header(default="", alias="X-Submission-Source"),
+    ):
+        source = submission_source.strip().lower()
+        if source not in {"mcp", "internal-ui"}:
+            raise HTTPException(status_code=403, detail="approved submission source is required")
 
-        user_base = SLURMJOB_BASE / req.username
+        username = req.username.strip()
+        command = req.command.strip()
+        venv = req.venv.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="username is required")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
+            raise HTTPException(status_code=400, detail="username contains unsupported characters")
+        if not command:
+            raise HTTPException(status_code=400, detail="command is required")
+        if not venv:
+            raise HTTPException(status_code=400, detail="venv is required")
+        if not 1 <= req.gpu <= 7:
+            raise HTTPException(status_code=400, detail="gpu must be between 1 and 7")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", req.job_name):
+            raise HTTPException(status_code=400, detail="job_name contains unsupported characters")
+
+        user_base = SLURMJOB_BASE / username
 
         # Determine repo_dir: default to user base if not specified
         if req.repo_dir:
@@ -1101,11 +1544,10 @@ def run_http_server(port: int = 8765):
                 )
             repo_dir = str(repo_dir_path)
         else:
-            repo_dir = str(user_base)
+            repo_dir = ""  # let generate_script infer from repo_url + username
 
         result = submit_job(
-            command=req.command or None,
-            script_path=req.script_path or None,
+            command=command,
             gpu=req.gpu,
             job_name=req.job_name or None,
             nodelist=req.nodelist or None,
@@ -1113,27 +1555,81 @@ def run_http_server(port: int = 8765):
             repo_dir=repo_dir,
             repo_url=req.repo_url,
             mem=req.mem,
-            venv=req.venv,
+            venv=venv,
+            username=username,
         )
         if not result["success"]:
             raise HTTPException(status_code=400, detail=result["error"])
-        # Record to SQLite
-        record_job(
+        result["submission_source"] = source
+        result["status"] = "submitted"
+        request_payload = json.dumps(
+          {
+            "command": command,
+            "username": username,
+            "gpu": req.gpu,
+            "job_name": req.job_name,
+            "nodelist": req.nodelist,
+            "branch": req.branch,
+            "repo_dir": repo_dir,
+            "repo_url": req.repo_url,
+            "mem": req.mem,
+            "venv": venv,
+          },
+          sort_keys=True,
+        )
+        try:
+          record_submission(
+            submission_id=result["submission_id"],
             job_id=result["job_id"],
-            username=req.username,
+            username=username,
             job_name=req.job_name or "job",
-            command=req.command,
+            command=command,
             gpu=req.gpu,
             nodelist=req.nodelist or "",
             repo_dir=repo_dir,
             repo_url=req.repo_url,
             branch=req.branch,
-        )
+            source_identity=result.get("source_identity", req.repo_url or repo_dir),
+            source_commit=result.get("source_commit", ""),
+            run_path=result.get("run_path", ""),
+            script_path=result.get("script_path", result.get("script", "")),
+            log_path=result.get("log_path", ""),
+            request_payload=request_payload,
+            status="submitted",
+            submission_source=source,
+          )
+        except (sqlite3.Error, OSError) as exc:
+          recovery_record = {
+            "submission_id": result["submission_id"],
+            "job_id": result["job_id"],
+            "status": "metadata_finalize_failed",
+            "error": str(exc),
+            "request_payload": request_payload,
+            "script_path": result.get("script_path", result.get("script", "")),
+            "log_path": result.get("log_path", ""),
+            "run_path": result.get("run_path", ""),
+          }
+          try:
+            recovery_path = write_recovery_record(recovery_record)
+          except OSError as recovery_exc:
+            recovery_path = f"unavailable: {recovery_exc}"
+          raise HTTPException(
+            status_code=500,
+            detail={**recovery_record, "recovery_path": recovery_path},
+          ) from exc
         return result
 
     @app.get("/queue")
     def queue(user: str = ""):
         return {"jobs": get_queue_json(user or None)}
+
+    @app.get("/health")
+    def health():
+      return {
+        "status": "ok",
+        "service": "slurm-api",
+        "version": SERVICE_VERSION,
+      }
 
     @app.get("/status/{job_id}")
     def status(job_id: str):
@@ -1156,16 +1652,15 @@ def run_http_server(port: int = 8765):
 
     @app.get("/logs/{job_id}")
     def logs(job_id: str):
-        import glob as _glob
-        matches = _glob.glob(f"/tmp/slurm_*_{job_id}.out")
-        if not matches:
-            return {"job_id": job_id, "log": f"(no log file found for job {job_id})"}
-        log_path = matches[0]
+        submission = get_submission_by_job_id(job_id)
+        if not submission or not submission.get("log_path"):
+            return {"job_id": job_id, "log": f"(no log metadata found for job {job_id})"}
+        log_path = submission["log_path"]
         try:
             content = Path(log_path).read_text(errors="replace")
             return {"job_id": job_id, "file": log_path, "log": content}
-        except Exception as e:
-            return {"job_id": job_id, "log": f"Error reading log: {e}"}
+        except OSError as exc:
+            return {"job_id": job_id, "file": log_path, "log": f"Error reading log: {exc}"}
 
     @app.get("/cluster")
     def cluster():
@@ -1222,6 +1717,7 @@ def run_http_server(port: int = 8765):
                     "body": {
                         "command": "要執行的指令 (必填), e.g. 'python3 -u train.py --lr 0.001'",
                         "username": "使用者名稱 (必填), e.g. 'alice' → repo 放在 /storage/SSD2/slurmjob/alice/",
+                        "venv": "共享虛擬環境名稱或核准路徑 (必填)",
                         "gpu": "GPU 數量 (預設 1)",
                         "job_name": "job 名稱 (預設 job)",
                         "nodelist": "指定節點 (選填)",
@@ -1238,8 +1734,16 @@ def run_http_server(port: int = 8765):
             }
         }
 
-    print(f"Slurm HTTP API running at http://0.0.0.0:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    return app
+
+
+def run_http_server(host: str = "127.0.0.1", port: int = 8765):
+    import uvicorn
+
+    init_db()
+    app = create_http_app()
+    print(f"Slurm HTTP API running at http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -1247,10 +1751,11 @@ def run_http_server(port: int = 8765):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--http", action="store_true", help="Run as HTTP server")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
     args = parser.parse_args()
 
     if args.http:
-        run_http_server(port=args.port)
+        run_http_server(host=args.host, port=args.port)
     else:
         run_mcp_server()

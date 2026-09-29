@@ -13,12 +13,12 @@ Usage:
 
 import argparse
 import json
-from typing import Optional
+import os
 
 import httpx
 from mcp.server.mcpserver import MCPServer
 
-DASHBOARD_URL = "http://ia-ai-server-5:8765"
+DASHBOARD_URL = os.environ.get("SLURM_API_URL", "http://127.0.0.1:8765")
 
 mcp = MCPServer(
     "slurm-gpu-cluster",
@@ -26,7 +26,24 @@ mcp = MCPServer(
 Use these tools to submit training jobs, monitor GPU usage,
 check job status and logs, and manage the cluster.
 Data must be on Internal NAS (/storage/Internal_NAS/).
-Venvs are shared at /storage/Internal_NAS/venvs/.""",
+Venvs are shared at /storage/Internal_NAS/venvs/.
+
+## 重要行為規則
+
+當使用者要求 training、跑模型、或執行任何 python script 時，一律使用 submit_job 透過 Slurm 送出，不要直接在本機執行。
+
+如果使用者沒有提供以下資訊，必須先問清楚再送：
+- username：使用者的名字（決定工作目錄 /storage/SSD2/slurmjob/<username>/）
+- venv：要用哪個虛擬環境（可用 list_venvs 列出選項）
+
+如果使用者之前已經說過 username 和 venv，記住並沿用，不用每次重複問。
+
+## 叢集資訊
+- ia-ai-server-4：2 GPU (RTX A6000)
+- ia-ai-server-5：2 GPU (RTX A6000)
+- AI-Server-6：7 GPU (2x RTX 4090 + 5x RTX 5090)
+- 共享 venv 位置：/storage/Internal_NAS/venvs/
+- Job 工作目錄：/storage/SSD2/slurmjob/<username>/""",
 )
 
 
@@ -41,31 +58,22 @@ def _api(method: str, path: str, **kwargs) -> dict:
 
 # ── Submit Job ──────────────────────────────────────────────
 
-@mcp.tool()
-def submit_job(
+def _submit_job_request(
     command: str,
     username: str,
+    venv: str,
     gpu: int = 1,
     job_name: str = "job",
     nodelist: str = "",
     repo_url: str = "",
     branch: str = "main",
-    venv: str = "",
     mem: str = "",
 ) -> str:
-    """Submit a GPU training job to the Slurm cluster.
+    username = username.strip()
+    venv = venv.strip()
+    if not username or not venv:
+        return "Error: username and venv are required; no Slurm job was submitted."
 
-    Args:
-        command: The training command, e.g. "python train.py --lr 1e-4"
-        username: Your name, determines working dir at /storage/SSD2/slurmjob/<username>/
-        gpu: Number of GPUs needed (default 1)
-        job_name: A short name for the job
-        nodelist: Target node (e.g. "AI-Server-6"), leave empty for auto
-        repo_url: GitHub repo to clone, e.g. "git@github.com:org/repo.git"
-        branch: Git branch (default "main")
-        venv: Shared venv name (e.g. "ltx2") or full path
-        mem: Memory limit (e.g. "32G"), leave empty for default
-    """
     body = {
         "command": command,
         "username": username,
@@ -78,10 +86,60 @@ def submit_job(
         "mem": mem,
     }
     try:
-        result = _api("POST", "/submit", json=body)
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except httpx.HTTPStatusError as e:
-        return f"Error: {e.response.text}"
+        result = _api(
+            "POST",
+            "/submit",
+            json=body,
+            headers={"X-Submission-Source": "mcp"},
+        )
+    except httpx.HTTPStatusError as exc:
+        return f"Error: {exc.response.text}"
+    except httpx.HTTPError as exc:
+        return f"Error: Slurm submission service is unavailable: {exc}"
+
+    if not result.get("success"):
+        return f"Error: {result.get('error', 'submission failed')}"
+    if not result.get("submission_id") or not result.get("job_id") or not result.get("status"):
+        return "Error: submission service returned an incomplete success response."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def submit_job(
+    command: str,
+    username: str,
+    venv: str,
+    gpu: int = 1,
+    job_name: str = "job",
+    nodelist: str = "",
+    repo_url: str = "",
+    branch: str = "main",
+    mem: str = "",
+) -> str:
+    """Submit a GPU training job to the Slurm cluster.
+
+    Args:
+        command: The training command, e.g. "python train.py --lr 1e-4"
+        username: Your name, determines working dir at /storage/SSD2/slurmjob/<username>/
+        venv: Shared venv name (e.g. "ltx2") or full path
+        gpu: Number of GPUs needed (default 1)
+        job_name: A short name for the job
+        nodelist: Target node (e.g. "AI-Server-6"), leave empty for auto
+        repo_url: GitHub repo to clone, e.g. "git@github.com:org/repo.git"
+        branch: Git branch (default "main")
+        mem: Memory limit (e.g. "32G"), leave empty for default
+    """
+    return _submit_job_request(
+        command=command,
+        username=username,
+        gpu=gpu,
+        job_name=job_name,
+        nodelist=nodelist,
+        repo_url=repo_url,
+        branch=branch,
+        venv=venv,
+        mem=mem,
+    )
 
 
 # ── GPU Status ──────────────────────────────────────────────
@@ -182,11 +240,17 @@ def job_history(limit: int = 20) -> str:
     jobs = data.get("jobs", [])
     if not jobs:
         return "No job history."
-    lines = [f"{'ID':<8} {'Name':<20} {'User':<10} {'Status':<10} {'Node':<15}"]
-    lines.append("-" * 65)
+    lines = [
+        f"{'ID':<8} {'Submission':<32} {'Commit':<12} "
+        f"{'Name':<20} {'User':<10} {'Status':<10} {'Node':<15}"
+    ]
+    lines.append("-" * 112)
     for j in jobs:
+        submission_id = j.get("submission_id") or "legacy"
+        source_commit = (j.get("source_commit") or "-")[:12]
         lines.append(
-            f"{j.get('job_id',''):<8} {j.get('job_name',''):<20} {j.get('username',''):<10} "
+            f"{j.get('job_id',''):<8} {submission_id:<32} {source_commit:<12} "
+            f"{j.get('job_name',''):<20} {j.get('username',''):<10} "
             f"{j.get('status',''):<10} {j.get('nodelist',''):<15}"
         )
     return "\n".join(lines)
@@ -219,32 +283,16 @@ def list_venvs() -> str:
     return "Available venvs:\n" + "\n".join(lines)
 
 
-# ── Create Venv ─────────────────────────────────────────────
-
-@mcp.tool()
-def create_venv(name: str, python_version: str = "") -> str:
-    """Create a new shared Python virtual environment on the NAS.
-
-    Args:
-        name: Name of the new venv (e.g. "mytrain"), will be created at /storage/Internal_NAS/venvs/<name>
-        python_version: Python interpreter to use (e.g. "python3.10"), defaults to system python3
-    """
-    try:
-        result = _api("POST", "/venvs/create", json={"name": name, "python_version": python_version})
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except httpx.HTTPStatusError as e:
-        return f"Error: {e.response.text}"
-
-
 # ── Main ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Slurm GPU Cluster MCP Server")
     parser.add_argument("--sse", action="store_true", help="Run in SSE mode (HTTP)")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8766, help="SSE port (default 8766)")
     args = parser.parse_args()
 
     if args.sse:
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=args.port)
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
     else:
         mcp.run()

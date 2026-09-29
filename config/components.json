@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-25",
+  "planning_home": "/storage/SSD2/hank/gpu_training",
+  "components": {
+    "slurm": {
+      "target_repo": "/home/hank/Code/slurm",
+      "upstream": "https://github.com/SchedMD/slurm.git",
+      "branch": "master",
+      "commit": "2135f20faf415f73786ee1b3851db3dd9de29279",
+      "checkout_version": "slurm-25-05-0-1-4243-g2135f20faf-dirty",
+      "deployed_version": {
+        "value": "21.08.5",
+        "status": "previously-observed",
+        "note": "Reconfirm daemon binaries on every target node before rollout."
+      },
+      "candidate_version": {
+        "value": "26.05.4",
+        "status": "selected-for-planning",
+        "note": "Build and compatibility validation are still required."
+      },
+      "update_policy": "maintenance-window"
+    },
+    "ltx2": {
+      "target_repo": "/home/hank/Code/LTX-2",
+      "upstream": "git@github.com:Lightricks/LTX-2.git",
+      "branch": null,
+      "commit": "a95ab856bf29407b6b066ede0abe1846050db56c",
+      "checkout_version": "readme-demo-window-3-ga95ab85",
+      "deployed_version": {
+        "value": null,
+        "status": "not-recorded",
+        "note": "Training runs must record their exact source commit."
+      },
+      "candidate_version": {
+        "value": "a95ab856bf29407b6b066ede0abe1846050db56c",
+        "status": "checkout-pin",
+        "note": "Promote only after a reproducible training validation."
+      },
+      "update_policy": "pull-request-and-training-validation"
+    },
+    "dcgm": {
+      "target_repo": "/home/hank/Code/DCGM",
+      "upstream": "https://github.com/NVIDIA/DCGM.git",
+      "branch": "master",
+      "commit": "e137795bc755d14fabc0e44c91178a364952cb43",
+      "checkout_version": "v4.4.2-1-ge137795-dirty",
+      "deployed_version": {
+        "value": null,
+        "status": "not-recorded",
+        "note": "Verify installed package and hostengine versions separately."
+      },
+      "candidate_version": {
+        "value": null,
+        "status": "not-selected",
+        "note": "Select only after driver compatibility review."
+      },
+      "update_policy": "driver-compatible-maintenance-window"
+    }
+  }
+}
