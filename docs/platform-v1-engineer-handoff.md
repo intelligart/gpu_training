@@ -2,29 +2,19 @@
 
 ## 0. 現況與下一步
 
-這不是 greenfield 安裝。2026-09-29 的 read-only 採證結果如下：
+這不是 greenfield 安裝。GPU Platform v1.0.0 已於 2026-09-30 在 `ia-ai-server-5` 完成受控 in-place rollout：
 
-- `ia-ai-server-5` 的 `slurmctld` 正常運作，版本為 `21.08.5`；本次升級不修改或重啟 Slurm controller。
-- `slurm-api.service` 與 `slurm-mcp.service` 均為 active，從 `/storage/SSD2/hank/gpu_training` 以 `/usr/bin/python3` 直接執行。
-- 兩個 legacy services 目前監聽 `0.0.0.0:8765` 與 `0.0.0.0:8766`，API `/health` 回傳 `404`。
-- v1 source、tests、deployment files 仍在未提交的 working tree；`HEAD` `6046d6869749ac07491100aa60cec0018ac0184b` 是目前可辨識的 legacy rollback candidate。
-- `/opt/gpu-platform` 尚不存在；第一次 rollout 必須先建立 immutable legacy snapshot 與 rollback units，不能假設已有 previous release symlink。
-- 目前沒有 active nginx service 或 `8443` gateway listener。
+- `slurm-api.service` 與 `slurm-mcp.service` 從 `/opt/gpu-platform/releases/1.0.0` 與獨立 service venv 執行。
+- 2026-10-01 經 Owner 核准啟用 trusted-VPN profile：完整 Dashboard/API 綁 `192.168.51.48:8765`，MCP 綁 `192.168.51.48:8766`，兩者都沒有 wildcard listener；submit/cancel 保留。
+- `slurmctld` 保持版本 `21.08.5` 且未在 rollout 中重啟；read-only health 與 MCP protocol smoke 通過。
+- MCP canary job `534` 以 1 GPU 在 RTX A6000 完成 CUDA 計算，`ExitCode=0:0`。
+- Previous release `/opt/gpu-platform/releases/legacy-6046d686` 與 backup `/opt/gpu-platform/backups/20260930T015008-CST` 保留。
 
-因此現在不要直接 restart 現有 services。現有 units 指向 mutable checkout；service crash、restart 或 reboot 都可能載入尚未 release 的 v1 source，並因新版預設 loopback bind 讓既有 direct clients 失去連線。
-
-你現在要做的是一次受控的 in-place application upgrade：
-
-1. **現在，無停機**：由 legacy commit 建立 immutable rollback snapshot/units，將 v1 變更 commit/push/tag，重跑 preflight，建立並保存 artifact/SHA-256。
-2. **現在，做決策**：選定 service account、工程師的內網 HTTPS/VPN gateway URL、存取政策、maintenance window 與 reviewer。
-3. **維護窗口**：備份 live units/config，安裝 versioned release/venv/gateway，只切換 `slurm-api` 與 `slurm-mcp`。
-4. **切換後**：執行 read-only API health、MCP discovery；失敗立即回復 legacy release。
-5. **另行核准**：透過 MCP 執行一個 canary，通過後才把 v1 endpoint 與操作說明交給工程師。
-6. **工程師端**：不安裝 Slurm、API 或 MCP server；只設定 MCP client，取得自己的 `username`、approved `venv` 與 repository/data 權限。
+完整 rollout/canary 證據見 [acceptance record](platform-v1-acceptance-2026-09-30.md)。工程師日常操作改由 [GPU Platform v1 使用指南](user-guide.md) 作為權威入口；本文件其餘部署章節保留供下一版 rollout 與 rollback 使用。
 
 ## 1. 交付狀態
 
-目前 OpenSpec change `launch-platform-v1` 完成 `15/17` tasks。程式、離線 deployment artifact 與 rollback 文件已完成；既有 legacy deployment 尚未切換到 v1，v1 canary 也尚未執行。
+OpenSpec change `launch-platform-v1` 已完成 `17/17` tasks，implementation fixed；仍等待非實作者 reviewer verification。
 
 | 能力 | 狀態 | 如何達成 | 驗證證據 |
 |---|---|---|---|
@@ -37,8 +27,8 @@
 | Safe retention | 完成 | List + dry-run；先查 Slurm active IDs；查詢失敗 fail closed；只刪 managed roots | Active/inactive fixture tests |
 | Versioned deployment | 完成 | v1 manifest、Python 3.10.12、exact lock、loopback systemd units、gateway 範例、deterministic tar | Config parser、double-build comparison、clean venv exact-lock test |
 | Offline preflight | 完成 | Syntax -> 20 tests -> OpenSpec -> Wave -> deployment -> runbook -> whitespace | Slurm job `528` passed |
-| Live rollout | 待 Owner 核准 | 依 rollout runbook 備份、切換、read-only health、可回滾 | OpenSpec task 4.4 |
-| Canary training | 待另行核准 | 經 deployed MCP 提交固定 fixture，驗證完整 metadata 與 terminal state | OpenSpec task 4.5 |
+| Live rollout | Fixed | 依 rollout runbook 備份、切換、read-only health、可回滾 | Acceptance record、OpenSpec task 4.4 |
+| Canary training | Fixed | 經 deployed MCP 提交固定 fixture，驗證完整 metadata 與 terminal state | Job `534`、OpenSpec task 4.5 |
 
 實作者只把已完成項目標成 fixed；verified 必須由另一位 reviewer 重跑驗收。
 
@@ -48,7 +38,7 @@
 flowchart LR
   E[Engineer / AI client] --> L[Trusted private LAN]
   L --> M[Slurm MCP 192.168.51.48:8766]
-    M --> A[Internal API 127.0.0.1:8765]
+    M --> A[Dashboard / API 192.168.51.48:8765]
     A --> S[Slurm sbatch / squeue / scancel]
     A --> D[(SQLite metadata)]
     A --> C[Locked Git cache]
@@ -94,8 +84,9 @@ flowchart LR
 
 v1 是 trusted-internal release：
 
-- Internal API 只綁 `127.0.0.1:8765`；pilot MCP 只綁 controller 私有位址 `192.168.51.48:8766`。
-- 一般 AI client 只取得 `/mcp` endpoint，不取得 loopback internal API。
+- Dashboard/API 與 MCP 分別只綁 controller 私有位址 `192.168.51.48:8765`、`192.168.51.48:8766`，不用 wildcard。
+- 一般 AI client 只註冊 `/mcp` endpoint，不把 Dashboard/raw API 設成 agent action 或 fallback。
+- Trusted VPN 使用者可直接使用完整 Dashboard/API，包括 submit/cancel；目前沒有完整 SSO/RBAC 或 per-user Slurm ownership enforcement。
 - `username` 目前是必要 audit identity，不是完整 authentication proof。
 - 完整 SSO/RBAC、per-user job ownership 與 public multi-tenant exposure 不在 v1；完成前不得公開到 Internet。
 - Training MCP 沒有 Slurm daemon restart、任意 admin shell 或 live config 能力。
@@ -163,8 +154,8 @@ readlink -f /opt/gpu-platform/current || true
 2. 建立 `$RELEASE_ROOT`，將 tar 以 `--strip-components=1` 解壓至該目錄。
 3. 以 Python 3.10.12 建立 `$VENV_ROOT`，安裝 `requirements-service.lock`，執行 `pip check` 與六個 service imports。
 4. 執行 `systemd-analyze verify` 與 gateway parser check。
-5. 安裝 review 後的 units；API 維持 loopback，MCP 只綁 `192.168.51.48`，不得使用 `0.0.0.0`。
-6. 一般 engineer 只取得 MCP URL，不得直接看到 internal adapter；未來 gateway 切換另走獨立 rollout。
+5. 安裝 review 後的 units；base API 維持 loopback。若 Owner 核准 trusted-VPN profile，再安裝 `slurm-api-vpn-bind.conf` 與 `slurm-mcp-vpn-backend.conf` drop-ins；不得使用 `0.0.0.0`。
+6. 一般 AI client 只註冊 MCP URL；Dashboard/raw API 的 VPN access 是受信任使用者操作面，不是 agent fallback。
 7. 原子更新 `/opt/gpu-platform/current`，執行 `systemctl daemon-reload`，只切換 `slurm-api` 與 `slurm-mcp`。
 8. 執行 read-only health checks；任一失敗立即依 runbook 恢復 previous units/config/release。
 
@@ -175,7 +166,7 @@ readlink -f /opt/gpu-platform/current || true
 Operator 保存以下輸出：
 
 ```bash
-curl --fail --silent --show-error http://127.0.0.1:8765/health
+curl --fail --silent --show-error http://192.168.51.48:8765/health
 systemctl is-active slurm-api.service slurm-mcp.service
 journalctl -u slurm-api.service -u slurm-mcp.service --since '<rollout-start>' --no-pager
 ```
@@ -281,11 +272,4 @@ job name 是 alice-baseline。
 
 ## 12. 交付完成定義
 
-目前可交付的是「通過離線驗證的 v1 release candidate」。要宣告可供工程師正式使用，仍需：
-
-1. Owner 核准並完成 task 4.4 live rollout。
-2. Read-only health 與 MCP discovery 通過。
-3. Owner 另行核准 task 4.5 canary 的 username、venv、GPU、fixture、node 與 rollback。
-4. 非實作者 reviewer 重跑 acceptance 並標記 verified。
-
-在此之前，工程師可 review 文件與 client 設定，但不應被告知 production endpoint 已上線。
+v1.0.0 已完成 Owner 核准的 live rollout、read-only health、MCP discovery 與 canary，工程師可在 trusted private LAN 依 [使用指南](user-guide.md) 使用。Change 目前是 implementation fixed；非實作者 reviewer 仍須重跑 [acceptance record](platform-v1-acceptance-2026-09-30.md) 的命令並標記 verified，之後才可 archive OpenSpec change。

@@ -3,6 +3,16 @@
 最新紀錄放在最上方。每個 lane 完成或 blocked 時留下可重跑證據；實作者不得自行
 將工作標記為 verified。
 
+## 2026-09-30T16:48Z · GitHub Copilot · trusted-VPN Dashboard/API bind
+
+- Change / task: Owner-approved v1 network profile follow-up；GitHub issue 尚未發布
+- Result: implementation fixed；完整 Dashboard/API 已綁 `192.168.51.48:8765` 並保留 submit/cancel，MCP 維持 `192.168.51.48:8766`；非實作者 reviewer verification pending
+- Target repo / files: `gpu_training`; `deploy/platform-v1/artifact.json`、`deploy/platform-v1/systemd/*vpn*.conf`、`scripts/validate-deployment-config.sh` 與 v1 使用/交付文件
+- Rollout: 在 `ia-ai-server-5` 安裝兩個 systemd drop-ins，MCP backend 同步改為 private-IP API；只重啟 `slurm-api.service`、`slurm-mcp.service`
+- Validation: `bash deploy/platform-v1/smoke-mcp.sh && curl --fail http://192.168.51.48:8765/ && ss -ltn '( sport = :8765 or sport = :8766 )' && scontrol ping` -> MCP initialize/discovery/read-only cluster query 通過，Dashboard HTTP 200，兩個 listener 精確綁 private IP，controller UP
+- Validation: `./scripts/validate-deployment-config.sh && ./scripts/validate-wave-workflow.sh && git diff --check` -> deployment artifact valid，Wave 0 errors/0 warnings，whitespace check 通過
+- Notes: backup `/opt/gpu-platform/backups/20261001T003959CST-vpn-api-bind`；rollback 為移除兩個 drop-ins、daemon-reload 並只重啟 API/MCP。`slurmctld` 未重啟，`NRestarts=0`；完整 API 目前沒有 SSO/RBAC 或 per-user ownership enforcement，不得公開到 Internet。實作者未標記 verified
+
 ## 2026-09-29T18:16Z · GitHub Copilot · v1 live rollout 與 MCP CUDA canary
 
 - Change / task: `launch-platform-v1`, tasks 4.4、4.5；GitHub issue 尚未發布

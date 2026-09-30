@@ -10,7 +10,9 @@ required_files=(
 	deploy/platform-v1/python-version
 	deploy/platform-v1/requirements-service.lock
 	deploy/platform-v1/systemd/slurm-api.service
+	deploy/platform-v1/systemd/slurm-api-vpn-bind.conf
 	deploy/platform-v1/systemd/slurm-mcp.service
+	deploy/platform-v1/systemd/slurm-mcp-vpn-backend.conf
 	deploy/platform-v1/nginx/gpu-platform.conf
 	deploy/platform-v1/smoke-mcp.sh
 	scripts/build-platform-v1-artifact.sh
@@ -34,6 +36,17 @@ if (manifest.services['slurm-api'].bind !== '127.0.0.1:8765') {
 if (manifest.services['slurm-mcp'].bind !== '192.168.51.48:8766') {
 	throw new Error(`unexpected MCP pilot bind: ${manifest.services['slurm-mcp'].bind}`);
 }
+const vpnProfile = manifest.profiles?.trusted_vpn;
+if (vpnProfile?.api_bind !== '192.168.51.48:8765') {
+	throw new Error(`unexpected trusted VPN API bind: ${vpnProfile?.api_bind}`);
+}
+if (vpnProfile?.mcp_bind !== '192.168.51.48:8766') {
+	throw new Error(`unexpected trusted VPN MCP bind: ${vpnProfile?.mcp_bind}`);
+}
+if (vpnProfile?.api_drop_in !== 'deploy/platform-v1/systemd/slurm-api-vpn-bind.conf' ||
+	vpnProfile?.mcp_drop_in !== 'deploy/platform-v1/systemd/slurm-mcp-vpn-backend.conf') {
+	throw new Error('trusted VPN profile references unexpected drop-ins');
+}
 if (!manifest.gateway.bind.startsWith('127.0.0.1:')) {
 	throw new Error(`non-loopback gateway example: ${manifest.gateway.bind}`);
 }
@@ -53,6 +66,8 @@ for package in fastapi httpx mcp pydantic starlette uvicorn; do
 
 /usr/bin/grep -q -- '--host 127.0.0.1 --port 8765' deploy/platform-v1/systemd/slurm-api.service
 /usr/bin/grep -q -- '--host 192.168.51.48 --port 8766' deploy/platform-v1/systemd/slurm-mcp.service
+/usr/bin/grep -q -- '--host 192.168.51.48 --port 8765' deploy/platform-v1/systemd/slurm-api-vpn-bind.conf
+/usr/bin/grep -q -- 'SLURM_API_URL=http://192.168.51.48:8765' deploy/platform-v1/systemd/slurm-mcp-vpn-backend.conf
 
 if /usr/bin/grep -Eq -- '--host (0\.0\.0\.0|::)' deploy/platform-v1/systemd/*.service; then
 	printf 'Service unit contains an uncontrolled listener.\n' >&2

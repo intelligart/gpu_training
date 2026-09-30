@@ -4,6 +4,8 @@
 
 Internal API 綁定 `127.0.0.1:8765`；Owner 核准的 pilot MCP 綁定 controller 的私有位址 `192.168.51.48:8766`。Reverse proxy 範例仍為 loopback-only，留作未來 HTTPS/VPN/SSO gateway 使用。MCP listener 不得改成 `0.0.0.0` 或公開到 Internet。
 
+Owner 另行核准的 VPN Dashboard/API profile 使用兩個 systemd drop-in：`slurm-api-vpn-bind.conf` 將完整 Dashboard/API 綁定至 `192.168.51.48:8765`，`slurm-mcp-vpn-backend.conf` 同步 MCP backend URL。此 profile 保留 submit/cancel routes，只能在已確認的 VPN/private network boundary 內使用；rollback 為移除兩個 drop-in 後重啟 application services。
+
 建立 artifact：
 
 ```bash

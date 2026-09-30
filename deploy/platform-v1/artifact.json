@@ -19,6 +19,15 @@
       "bind": "192.168.51.48:8766"
     }
   },
+  "profiles": {
+    "trusted_vpn": {
+      "api_drop_in": "deploy/platform-v1/systemd/slurm-api-vpn-bind.conf",
+      "mcp_drop_in": "deploy/platform-v1/systemd/slurm-mcp-vpn-backend.conf",
+      "api_bind": "192.168.51.48:8765",
+      "mcp_bind": "192.168.51.48:8766",
+      "access": "full Dashboard/API including submit and cancel for trusted VPN users"
+    }
+  },
   "gateway": {
     "config": "deploy/platform-v1/nginx/gpu-platform.conf",
     "bind": "127.0.0.1:8443",

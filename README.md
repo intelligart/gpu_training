@@ -4,15 +4,15 @@
 
 ## 目前狀態
 
-- `ia-ai-server-5` 已有 legacy `slurm-api`、`slurm-mcp` 與 Slurm controller 正在服務；這次工作是原地升級，不是從零安裝叢集。
-- OpenSpec `launch-platform-v1`：`15/17` tasks 完成。
+- GPU Platform v1.0.0 已在 `ia-ai-server-5` 上線；MCP endpoint 為 `http://192.168.51.48:8766/mcp`，Owner 核准的 trusted-VPN Dashboard/API 綁定 controller private interface 的 port `8765`，保留 submit/cancel。
+- OpenSpec `launch-platform-v1`：`17/17` tasks 完成，implementation fixed；仍等待非實作者 reviewer verification。
 - MCP contract、submission isolation、SQLite metadata、精確 log、cleanup、deployment artifact、preflight 與 rollback runbook 已完成。
-- Slurm MCP job `528` 已通過 20 個 unit/concurrency tests 與全部 preflight gates。
-- Slurm MCP job `531` 已驗證 clean venv install、`pip check`、service imports 與 exact dependency lock。
-- 尚未把既有 application services 切換到 v1 artifact，也尚未執行 v1 canary；這兩項需要 Owner 另外核准。
+- Slurm MCP job `533` 已通過 22 個 tests 與全部 preflight gates；job `534` 已完成 1-GPU RTX A6000 CUDA canary。
+- Live artifact、health、rollback 與 canary 證據見 [v1 acceptance record](docs/platform-v1-acceptance-2026-09-30.md)。
 
 ## 文件入口
 
+- [工程師使用指南](docs/user-guide.md)：code、dataset、venv、1/2-GPU tests、training 與 output flow。
 - [工程師交付與部署指南](docs/platform-v1-engineer-handoff.md)：成果、架構、部署、工程師 onboarding 與日常使用。
 - [Rollout/rollback runbook](docs/platform-v1-rollout.md)：live 變更紀錄、核准、健康檢查與回滾。
 - [MCP 使用說明](MCP_GUIDE.md)：AI client 設定、工具與 submission 範例。

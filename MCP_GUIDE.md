@@ -8,7 +8,7 @@ AI client -> trusted private-LAN MCP endpoint -> internal adapter -> Slurm
 
 ## 上線狀態
 
-`ia-ai-server-5` 已有 legacy MCP/API endpoint 正在服務。v1 release candidate 已通過離線 preflight，但尚未切換 live services，也尚未執行 v1 canary；既有 endpoint 在 rollout 前只能視為 legacy service，不能宣稱已具備本文件列出的 v1 isolation 與 release guarantees。
+GPU Platform v1.0.0 已在 `ia-ai-server-5` 上線。MCP endpoint 是 `http://192.168.51.48:8766/mcp`；Owner 核准的完整 Dashboard/API 綁定 controller private interface 的 port `8765`，限 trusted VPN 使用並保留 submit/cancel。Read-only MCP smoke 與 1-GPU CUDA canary job `534` 已通過，實作者標示 fixed；非實作者 reviewer verification pending。
 
 ## 使用政策
 
@@ -19,7 +19,7 @@ AI client -> trusted private-LAN MCP endpoint -> internal adapter -> Slurm
 - Endpoint、token 與憑證只放 machine-local secret/config，不提交到 repository。
 - v1 只允許 trusted internal network/VPN/gateway，不得公開到 Internet。
 
-完整工程師交付流程見 [工程師交付與部署指南](docs/platform-v1-engineer-handoff.md)。Claude、Copilot 與 ChatGPT 的共同設定契約見 [AI training integration contract](docs/agent-training-integration.md)。
+日常 code、dataset、venv 與不同 GPU task flow 見 [工程師使用指南](docs/user-guide.md)。完整部署流程見 [工程師交付與部署指南](docs/platform-v1-engineer-handoff.md)。Claude、Copilot 與 ChatGPT 的共同設定契約見 [AI training integration contract](docs/agent-training-integration.md)。
 
 ## Client 設定
 
@@ -36,9 +36,89 @@ AI client -> trusted private-LAN MCP endpoint -> internal adapter -> Slurm
 }
 ```
 
-需要 Node.js 與 `npx`。此明文 HTTP profile 只核准用於受信任的 `192.168.51.0/24` 私有網路；不得從 Internet 暴露。未來啟用 HTTPS gateway 後移除 `--allow-http`。
+需要 Node.js 與 `npx`。此明文 HTTP profile 只核准用於受信任的 VPN/private network；不得從 Internet 暴露。未來啟用 HTTPS gateway 後移除 `--allow-http`。
 
-VS Code Copilot 與 ChatGPT 也只註冊管理員提供的 MCP endpoint。Client 不支援 remote MCP 時，該 client 暫不支援 training，不建立 raw API fallback。
+VS Code Copilot 的 machine-local workspace 設定：
+
+```json
+{
+  "servers": {
+    "slurmGpuCluster": {
+      "type": "http",
+      "url": "http://192.168.51.48:8766/mcp"
+    }
+  }
+}
+```
+
+儲存後重新載入 client，確認 tool picker 可看到 `cluster_info`、`list_venvs` 與 `submit_job`。VS Code Copilot、ChatGPT 與其他 client 都只註冊管理員提供的 MCP endpoint。Client 不支援 private HTTP remote MCP 時，該 client 暫不支援 training，不建立 raw API fallback。這些設定只放使用者本機，不提交至公開或共用的 source repository。
+
+## 新增使用者 onboarding
+
+Operator 先提供並確認：
+
+1. VPN/private-LAN access，以及 `192.168.51.48:8766` 的 network route。
+2. 使用者的固定 `username` audit label。
+3. 核准的 shared `venv` 名稱。
+4. 可讀取的 Git repository、dataset 與 checkpoint path。
+5. 可使用的 GPU 數量、memory 與 node policy。
+
+目前沒有 per-user authentication 或 Slurm ownership isolation；所有 submission 由 service identity `hank` 執行，`username` 只用於 audit metadata。只能加入受信任的 VPN 成員，不得把 endpoint 公開到 Internet。
+
+使用者完成 client 設定後，先貼上 read-only 驗證範本：
+
+```text
+我的 username 是 <username>，核准的 venv 是 <venv>。
+只使用 slurm-gpu-cluster MCP，不要執行本機 training，也不要使用 raw API fallback。
+請呼叫 cluster_info、gpu_status、list_venvs，整理目前 cluster、GPU 與 venv 狀態。
+這次不要提交或取消任何 job。
+```
+
+若工具清單或 read-only 結果不完整，停止 onboarding 並通知 Operator，不要嘗試 raw HTTP fallback。
+
+## 對話範本
+
+1-GPU smoke：
+
+```text
+我的 username 是 <username>，venv 是 <venv>。
+只使用 slurm-gpu-cluster MCP，從 <repo-url> 的 commit <full-commit-sha>，
+使用 1 張 GPU、<memory> memory 執行：
+<smoke-command>
+job name 是 <username>-smoke。
+提交成功後回報 submission_id、job_id、status 與固定的 source commit。
+```
+
+2-GPU training：
+
+```text
+我的 username 是 <username>，venv 是 <venv>。
+只使用 slurm-gpu-cluster MCP，從 <repo-url> 的 commit <full-commit-sha>，
+使用 2 張 GPU、<memory> memory 執行：
+<distributed-training-command>
+job name 是 <username>-<experiment>。
+除非 Operator 已指定，請不要自行設定 nodelist。
+提交成功後回報 submission_id、job_id、status 與固定的 source commit。
+```
+
+查詢狀態與 log：
+
+```text
+只使用 Slurm MCP 查詢 job <job-id>；先回報 queue/status，再用 get_logs 讀取 exact log。
+不要從目錄或 wildcard 猜測 log，也不要提交或取消其他 job。
+```
+
+取消採兩步確認。第一步只檢查：
+
+```text
+只使用 Slurm MCP 查詢 job <job-id> 的狀態與 job name，先回報結果，不要取消。
+```
+
+確認 job ID 後再下第二個明確指令：
+
+```text
+我確認要取消 job <job-id>。只呼叫 Slurm MCP cancel_job，完成後回報結果。
+```
 
 ## 可用工具
 
@@ -92,12 +172,12 @@ job name 是 alice-baseline。
 Engineer / AI client
   -> trusted private LAN
   -> mcp_server.py (192.168.51.48:8766)
-    -> slurm_server.py internal adapter (loopback 127.0.0.1:8765)
+    -> slurm_server.py Dashboard/API (192.168.51.48:8765)
     -> sbatch / squeue / scancel
     -> Slurm cluster
 ```
 
-一般工程師只取得 MCP URL。Loopback adapter 與 Dashboard 是 implementation boundary，不是 agent action。
+一般 AI client 只註冊 MCP URL，不把 raw API 設成 agent action。Dashboard/API 目前可由受信任 VPN 使用者直接存取；它沒有完整 SSO/RBAC 或 per-user Slurm ownership enforcement，不得公開到 Internet。
 
 ## 常見錯誤
 
