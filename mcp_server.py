@@ -151,23 +151,46 @@ def gpu_status() -> str:
     """
     data = _api("GET", "/gpu-status")
     lines = []
-    for node_name, gpus in data.items():
+    for node_name, node_data in data.items():
         lines.append(f"\n=== {node_name} ===")
+        gpus = node_data
+        if isinstance(node_data, dict):
+            if "error" in node_data:
+                lines.append(f"  Error: {node_data['error']}")
+                continue
+            lines.append(f"  State: {node_data.get('state', 'unknown')}")
+            gpus = node_data.get("gpus", [])
         if isinstance(gpus, list):
+            if not gpus:
+                lines.append("  No GPU device telemetry available; do not infer availability.")
             for g in gpus:
-                used = g.get("mem_used_gb", "?")
-                total = g.get("mem_total_gb", "?")
-                util = g.get("utilization", "?")
+                if "mem_used_mb" in g or "mem_total_mb" in g:
+                    used = g.get("mem_used_mb", "?")
+                    total = g.get("mem_total_mb", "?")
+                    unit = "MB"
+                else:
+                    used = g.get("mem_used_gb", "?")
+                    total = g.get("mem_total_gb", "?")
+                    unit = "GB"
+                util = g.get("util_pct", g.get("utilization", "?"))
                 model = g.get("name", "")
                 procs = g.get("processes", [])
-                lines.append(f"  GPU {g.get('index', '?')}: {model}  {used}/{total} GB  util={util}%")
-                for p in procs:
-                    user = p.get("user", "?")
-                    pname = p.get("name", "?")
-                    pmem = p.get("used_memory_mb", "?")
-                    lines.append(f"    └─ {user}: {pname} ({pmem} MB)")
-        elif isinstance(gpus, dict) and "error" in gpus:
-            lines.append(f"  Error: {gpus['error']}")
+                lines.append(f"  GPU {g.get('index', '?')}: {model}  {used}/{total} {unit}  util={util}%")
+                if isinstance(procs, str):
+                    if procs:
+                        lines.append(f"    Processes: {procs}")
+                elif isinstance(procs, list):
+                    for p in procs:
+                        if not isinstance(p, dict):
+                            raise ValueError(f"Invalid GPU process telemetry for {node_name}")
+                        user = p.get("user", "?")
+                        pname = p.get("name", "?")
+                        pmem = p.get("used_memory_mb", "?")
+                        lines.append(f"    └─ {user}: {pname} ({pmem} MB)")
+                else:
+                    raise ValueError(f"Invalid GPU process telemetry for {node_name}")
+        else:
+            lines.append("  Invalid GPU telemetry response; do not infer availability.")
     return "\n".join(lines) if lines else "No GPU data available"
 
 

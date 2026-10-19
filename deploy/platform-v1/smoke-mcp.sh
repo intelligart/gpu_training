@@ -56,6 +56,15 @@ curl --fail --silent --show-error --max-time 20 \
 	--data-binary '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cluster_info","arguments":{}}}'
 /usr/bin/grep -q '"isError":false' "$body_file"
 
+curl --fail --silent --show-error --max-time 20 \
+	--output "$body_file" \
+	--request POST "$endpoint" \
+	--header 'Content-Type: application/json' \
+	--header 'Accept: application/json, text/event-stream' \
+	--header "Mcp-Session-Id: $session_id" \
+	--data-binary '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"gpu_status","arguments":{}}}'
+/usr/bin/grep -q '"isError":false' "$body_file"
+
 curl --fail --silent --show-error --max-time 5 \
 	--output /dev/null \
 	--request DELETE "$endpoint" \

@@ -28,6 +28,55 @@ import mcp_server
 
 
 class SubmitJobContractTests(unittest.TestCase):
+    @patch("mcp_server._api")
+    def test_gpu_status_handles_live_mb_metrics_and_process_text(self, api_mock):
+        api_mock.return_value = {"node": {"state": "idle", "gpus": [
+            {"index": 0, "name": "A6000", "mem_used_mb": 38511, "mem_total_mb": 49140,
+             "util_pct": 100, "processes": "other/python (37638MB), hank/python (824MB)"},
+            {"index": 1, "name": "A6000", "mem_used_mb": 0, "mem_total_mb": 49140,
+             "util_pct": 0, "processes": ""}
+        ]}}
+        result = mcp_server.gpu_status()
+        api_mock.assert_called_once_with("GET", "/gpu-status")
+        self.assertIn("38511/49140 MB  util=100%", result)
+        self.assertIn("other/python (37638MB), hank/python (824MB)", result)
+        self.assertIn("0/49140 MB  util=0%", result)
+        self.assertNotIn("?/? GB", result)
+
+    @patch("mcp_server._api")
+    def test_gpu_status_does_not_mix_partial_mb_metrics_with_legacy_gb(self, api_mock):
+        api_mock.return_value = {"node": [{"mem_used_mb": 512, "mem_total_gb": 48}]}
+        self.assertIn("512/? MB", mcp_server.gpu_status())
+
+    @patch("mcp_server._api")
+    def test_gpu_status_rejects_invalid_process_telemetry(self, api_mock):
+        for processes in (None, 42, ["invalid"]):
+            with self.subTest(processes=processes):
+                api_mock.return_value = {"node": [{"processes": processes}]}
+                with self.assertRaisesRegex(ValueError, "Invalid GPU process telemetry"):
+                    mcp_server.gpu_status()
+
+    @patch("mcp_server._api")
+    def test_gpu_status_handles_nested_backend_devices_and_processes(self, api_mock):
+        api_mock.return_value = {"node": {"state": "idle", "gpus": [
+            {"index": 0, "name": "A6000", "mem_used_gb": 38, "mem_total_gb": 48,
+             "utilization": 100, "processes": [{"user": "other", "name": "trainer", "used_memory_mb": 38000}]}
+        ]}}
+        result = mcp_server.gpu_status()
+        self.assertIn("State: idle", result)
+        self.assertIn("GPU 0: A6000", result)
+        self.assertIn("other: trainer", result)
+        self.assertIn("util=100%", result)
+
+    @patch("mcp_server._api")
+    def test_gpu_status_preserves_legacy_errors_and_missing_telemetry(self, api_mock):
+        api_mock.return_value = {"old": [{"index": 1, "name": "legacy"}],
+                                 "offline": {"error": "unreachable"}, "missing": {"state": "idle", "gpus": []}}
+        result = mcp_server.gpu_status()
+        self.assertIn("GPU 1: legacy", result)
+        self.assertIn("Error: unreachable", result)
+        self.assertIn("do not infer availability", result)
+
     def test_submit_job_schema_requires_venv(self):
         signature = inspect.signature(mcp_server.submit_job)
 
