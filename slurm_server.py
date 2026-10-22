@@ -13,11 +13,21 @@ Slurm MCP + HTTP Server
 
 import subprocess
 import os
+import re
 import argparse
+import json
 import tempfile
 import shlex
+import sqlite3
+import socket
+import threading
+import uuid
+import fcntl
+import hashlib
+import shutil
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 SLURM_CONF = "/etc/slurm/slurm.conf"
 SBATCH = "/usr/bin/sbatch"
@@ -26,23 +36,527 @@ SCANCEL = "/usr/bin/scancel"
 SINFO = "/usr/bin/sinfo"
 JOBS_DIR = Path("/home/hank/Code/slurm-jobs")
 GENERATED_SCRIPTS_DIR = Path("/tmp/slurm-generated")
+NAS_LOGS_DIR = Path("/storage/Internal_NAS/logs")
+SOURCE_CACHE_BASE = Path("/storage/Internal_NAS/slurm-source-cache")
+RUNS_BASE = Path("/storage/Internal_NAS/slurm-runs")
+RECOVERY_DIR = Path("/storage/Internal_NAS/slurm-recovery")
 
 ENV = {**os.environ, "SLURM_CONF": SLURM_CONF}
+SERVICE_VERSION = os.environ.get("GPU_PLATFORM_VERSION", "development")
 
-# Per-node venv activation (維護在這裡，不用每個 script 各自寫)
-VENV_ACTIVATE = """
-case "$SLURMD_NODENAME" in
-    ia-ai-server-5) source /storage/SSD2/hank/ComfyUI/venv/bin/activate ;;
-    ia-ai-server-4|AI-Server-6) source /storage/SSD2/hank/gpu_training/venv/bin/activate ;;
-esac
-"""
+# Shared venvs on NAS — 放在這個目錄下的子目錄會自動被偵測為可用 venv
+VENVS_BASE = Path("/storage/Internal_NAS/venvs")
+
+# Restore historical manual-HTTP defaults, not an MCP identity/auth mechanism.
+# Operators may replace the complete mapping using a JSON environment variable.
+# Values are checked on the allocated worker, never silently replaced by system Python.
+LEGACY_DEFAULT_USERNAME = "hank"
+LEGACY_NODE_VENVS = {
+  "ia-ai-server-5": "/storage/SSD2/hank/ComfyUI/venv",
+  "ia-ai-server-4": "/storage/SSD2/hank/gpu_training/venv",
+  "AI-Server-6": "/storage/SSD2/hank/gpu_training/venv",
+}
+
+
+def get_legacy_node_venvs() -> dict[str, str]:
+  """Snapshot Operator defaults; reject invalid settings before sbatch."""
+  raw = os.environ.get("GPU_PLATFORM_NODE_VENVS")
+  mapping = json.loads(raw) if raw is not None else dict(LEGACY_NODE_VENVS)
+  if not isinstance(mapping, dict) or not mapping:
+    raise ValueError("GPU_PLATFORM_NODE_VENVS must be a nonempty JSON object")
+  for node, venv_path in mapping.items():
+    if not isinstance(node, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", node):
+      raise ValueError("Default venv mapping contains an invalid node name")
+    if not isinstance(venv_path, str) or not venv_path.startswith("/") or "\n" in venv_path or "\r" in venv_path:
+      raise ValueError("Default venv mapping must contain absolute paths")
+  return mapping
+
+
+def render_job_environment(venv: str) -> str:
+  """Select/validate the environment on the worker before running user code."""
+  if venv:
+    selection = f"JOB_VENV={shlex.quote(resolve_venv(venv))}"
+  else:
+    cases = "\n".join(
+      f"    {node}) JOB_VENV={shlex.quote(path)} ;;"
+      for node, path in sorted(get_legacy_node_venvs().items())
+    )
+    selection = f'''case "${{SLURMD_NODENAME:-}}" in
+{cases}
+  *) echo "ERROR: No default venv configured for node ${{SLURMD_NODENAME:-unknown}}" >&2; exit 1 ;;
+esac'''
+  return f'''{selection}
+if [ ! -r "$JOB_VENV/bin/activate" ] || [ ! -x "$JOB_VENV/bin/python" ] || [ ! -x "$JOB_VENV/bin/python3" ]; then
+  echo "ERROR: Invalid job venv on ${{SLURMD_NODENAME:-unknown}}: $JOB_VENV (activate/python/python3 required)" >&2
+  exit 1
+fi
+source "$JOB_VENV/bin/activate"
+# Keep the selected directory ahead of PATH even if activate contains an old path.
+export PATH="$JOB_VENV/bin:$PATH"
+hash -r
+if ! "$JOB_VENV/bin/python" --version || ! "$JOB_VENV/bin/python3" --version; then
+  echo "ERROR: Job venv interpreter cannot start: $JOB_VENV" >&2
+  exit 1
+fi
+printf 'Job environment: node=%s venv=%s python=%s\\n' "${{SLURMD_NODENAME:-unknown}}" "$JOB_VENV" "$JOB_VENV/bin/python"
+'''
+
+def get_available_venvs() -> list[dict]:
+    """掃描 VENVS_BASE 下的目錄，自動偵測可用 venvs"""
+    venvs = []
+    if VENVS_BASE.exists():
+        for d in sorted(VENVS_BASE.iterdir()):
+            if d.is_dir():
+                activate = d / "bin" / "activate"
+                venvs.append({"name": d.name, "path": str(d), "exists": activate.exists()})
+    return venvs
+
+def resolve_venv(venv: str) -> str:
+    """解析 venv 名稱或路徑，回傳完整路徑"""
+    if not venv:
+        return ""
+    # 如果已經是絕對路徑，直接回傳
+    if venv.startswith("/"):
+        return venv
+    # 當作 VENVS_BASE 下的名稱，組成完整路徑
+    return str(VENVS_BASE / venv)
 
 DEFAULT_REPO_DIR = "/storage/SSD2/hank/gpu_training"
+SLURMJOB_BASE = Path("/storage/SSD2/slurmjob")
+DB_PATH = Path("/storage/SSD2/hank/gpu_training/slurm_history.db")
+
+SUBMISSION_COLUMNS = {
+  "submission_id": "TEXT",
+  "source_identity": "TEXT DEFAULT ''",
+  "source_commit": "TEXT DEFAULT ''",
+  "run_path": "TEXT DEFAULT ''",
+  "script_path": "TEXT DEFAULT ''",
+  "log_path": "TEXT DEFAULT ''",
+  "request_payload": "TEXT DEFAULT ''",
+  "status": "TEXT DEFAULT 'legacy'",
+  "submission_source": "TEXT DEFAULT 'legacy'",
+}
+
+
+def _connect_db() -> sqlite3.Connection:
+  conn = sqlite3.connect(DB_PATH, timeout=5)
+  conn.execute("PRAGMA busy_timeout = 5000")
+  return conn
+
+
+def init_db():
+    conn = _connect_db()
+    try:
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id TEXT,
+                    job_id TEXT,
+                    username TEXT,
+                    job_name TEXT,
+                    command TEXT,
+                    gpu INTEGER,
+                    nodelist TEXT,
+                    repo_dir TEXT,
+                    repo_url TEXT,
+                    branch TEXT,
+                    source_identity TEXT DEFAULT '',
+                    source_commit TEXT DEFAULT '',
+                    run_path TEXT DEFAULT '',
+                    script_path TEXT DEFAULT '',
+                    log_path TEXT DEFAULT '',
+                    request_payload TEXT DEFAULT '',
+                    status TEXT DEFAULT 'legacy',
+                    submission_source TEXT DEFAULT 'legacy',
+                    submit_time TEXT
+                )
+                """
+            )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+            for column, declaration in SUBMISSION_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS jobs_submission_id_unique
+                ON jobs(submission_id)
+                WHERE submission_id IS NOT NULL
+                """
+            )
+    finally:
+        conn.close()
+
+
+def record_submission(
+  *,
+  submission_id: Optional[str],
+  job_id: Optional[str],
+  username: str,
+  job_name: str,
+  command: str,
+  gpu: int,
+  nodelist: str = "",
+  repo_dir: str = "",
+  repo_url: str = "",
+  branch: str = "main",
+  source_identity: str = "",
+  source_commit: str = "",
+  run_path: str = "",
+  script_path: str = "",
+  log_path: str = "",
+  request_payload: str = "",
+  status: str = "submitted",
+  submission_source: str = "legacy",
+) -> None:
+  conn = _connect_db()
+  try:
+    with conn:
+      conn.execute(
+        """
+        INSERT INTO jobs (
+          submission_id, job_id, username, job_name, command, gpu,
+          nodelist, repo_dir, repo_url, branch, source_identity,
+          source_commit, run_path, script_path, log_path,
+          request_payload, status, submission_source, submit_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+          submission_id or None,
+          job_id,
+          username,
+          job_name,
+          command,
+          gpu,
+          nodelist,
+          repo_dir,
+          repo_url,
+          branch,
+          source_identity,
+          source_commit,
+          run_path,
+          script_path,
+          log_path,
+          request_payload,
+          status,
+          submission_source,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+      )
+  finally:
+    conn.close()
+
+
+def record_job(job_id: str, username: str, job_name: str, command: str,
+               gpu: int, nodelist: str, repo_dir: str, repo_url: str, branch: str,
+               submission_source: str = "legacy"):
+  record_submission(
+    submission_id=None,
+    job_id=job_id,
+    username=username,
+    job_name=job_name,
+    command=command,
+    gpu=gpu,
+    nodelist=nodelist,
+    repo_dir=repo_dir,
+    repo_url=repo_url,
+    branch=branch,
+    submission_source=submission_source,
+  )
+
+
+def get_submission(submission_id: str) -> Optional[dict]:
+  conn = _connect_db()
+  conn.row_factory = sqlite3.Row
+  try:
+    row = conn.execute(
+      "SELECT * FROM jobs WHERE submission_id = ?", (submission_id,)
+    ).fetchone()
+    return dict(row) if row else None
+  finally:
+    conn.close()
+
+
+def get_submission_by_job_id(job_id: str) -> Optional[dict]:
+  conn = _connect_db()
+  conn.row_factory = sqlite3.Row
+  try:
+    row = conn.execute(
+      "SELECT * FROM jobs WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+      (job_id,),
+    ).fetchone()
+    return dict(row) if row else None
+  finally:
+    conn.close()
+
+
+def write_recovery_record(record: dict) -> str:
+  RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+  recovery_path = RECOVERY_DIR / f"{record['submission_id']}.json"
+  file_descriptor, temporary_name = tempfile.mkstemp(
+    dir=RECOVERY_DIR,
+    prefix=f".{record['submission_id']}-",
+    suffix=".tmp",
+    text=True,
+  )
+  temporary_path = Path(temporary_name)
+  try:
+    with os.fdopen(file_descriptor, "w") as stream:
+      json.dump(record, stream, sort_keys=True)
+      stream.write("\n")
+      stream.flush()
+      os.fsync(stream.fileno())
+    os.replace(temporary_path, recovery_path)
+  finally:
+    temporary_path.unlink(missing_ok=True)
+  return str(recovery_path)
+
+
+def get_history(limit: int = 100) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+class SlurmStatusError(RuntimeError):
+  pass
+
+
+def get_active_job_ids() -> set[str]:
+  stdout, stderr, return_code = run_cmd(
+    [SQUEUE, "-h", "-t", "PENDING,RUNNING,CONFIGURING,COMPLETING", "-o", "%i"]
+  )
+  if return_code != 0:
+    raise SlurmStatusError(stderr or "Unable to query active Slurm jobs")
+  return {line.strip() for line in stdout.splitlines() if line.strip()}
+
+
+def list_cleanup_candidates(days: int = 30) -> list[dict]:
+  active_job_ids = get_active_job_ids()
+  conn = _connect_db()
+  conn.row_factory = sqlite3.Row
+  try:
+    rows = conn.execute(
+      "SELECT * FROM jobs WHERE submit_time < datetime('now', ?)",
+      (f"-{days} days",),
+    ).fetchall()
+  finally:
+    conn.close()
+
+  candidates = []
+  for row in rows:
+    candidate = dict(row)
+    candidate["active"] = bool(
+      candidate.get("job_id") and candidate["job_id"] in active_job_ids
+    )
+    candidate["cleanup_eligible"] = not candidate["active"]
+    candidates.append(candidate)
+  return candidates
+
+
+def _remove_managed_artifact(path_value: str, allowed_root: Path) -> None:
+  if not path_value:
+    return
+  artifact_path = Path(path_value).resolve()
+  root_path = allowed_root.resolve()
+  try:
+    artifact_path.relative_to(root_path)
+  except ValueError as exc:
+    raise ValueError(f"Refusing to remove unmanaged artifact: {artifact_path}") from exc
+
+  if artifact_path.is_dir():
+    shutil.rmtree(artifact_path)
+  else:
+    artifact_path.unlink(missing_ok=True)
+
+
+def cleanup_old_jobs(days: int = 30, dry_run: bool = True) -> dict:
+  candidates = list_cleanup_candidates(days)
+  eligible = [candidate for candidate in candidates if candidate["cleanup_eligible"]]
+  skipped_active = [candidate for candidate in candidates if candidate["active"]]
+  if dry_run:
+    return {
+      "dry_run": True,
+      "eligible": eligible,
+      "skipped_active": skipped_active,
+      "deleted": [],
+    }
+
+  deleted = []
+  for candidate in eligible:
+    _remove_managed_artifact(candidate.get("run_path", ""), RUNS_BASE)
+    _remove_managed_artifact(candidate.get("script_path", ""), GENERATED_SCRIPTS_DIR)
+    _remove_managed_artifact(candidate.get("log_path", ""), NAS_LOGS_DIR)
+    conn = _connect_db()
+    try:
+      with conn:
+        conn.execute("DELETE FROM jobs WHERE id = ?", (candidate["id"],))
+    finally:
+      conn.close()
+    deleted.append(candidate)
+
+  return {
+    "dry_run": False,
+    "eligible": eligible,
+    "skipped_active": skipped_active,
+    "deleted": deleted,
+  }
+
+
+def get_stats() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    stats = {}
+    # jobs per user
+    rows = conn.execute(
+        "SELECT username, COUNT(*) as count, SUM(gpu) as total_gpu FROM jobs GROUP BY username ORDER BY count DESC"
+    ).fetchall()
+    stats["by_user"] = [{"username": r[0], "jobs": r[1], "total_gpu": r[2] or 0} for r in rows]
+    # jobs per node
+    rows = conn.execute(
+        "SELECT nodelist, COUNT(*) as count FROM jobs WHERE nodelist != '' GROUP BY nodelist ORDER BY count DESC"
+    ).fetchall()
+    stats["by_node"] = [{"node": r[0], "jobs": r[1]} for r in rows]
+    # total
+    row = conn.execute("SELECT COUNT(*), SUM(gpu) FROM jobs").fetchone()
+    stats["total_jobs"] = row[0] or 0
+    stats["total_gpu_requested"] = row[1] or 0
+    conn.close()
+    return stats
 
 
 def run_cmd(cmd: list[str]) -> tuple[str, str, int]:
     result = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
     return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+
+class SourcePreparationError(RuntimeError):
+  pass
+
+
+def _run_source_command(command: list[str]) -> str:
+  result = subprocess.run(command, capture_output=True, text=True, env=ENV)
+  if result.returncode != 0:
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
+    raise SourcePreparationError(detail)
+  return result.stdout.strip()
+
+
+def _resolve_source_commit(cache_path: Path, requested_ref: str) -> str:
+  candidates = [
+    f"refs/remotes/origin/{requested_ref}",
+    f"refs/heads/{requested_ref}",
+    requested_ref,
+  ]
+  if requested_ref == "main":
+    candidates.append("HEAD")
+  for candidate in candidates:
+    result = subprocess.run(
+      ["git", "--git-dir", str(cache_path), "rev-parse", "--verify", f"{candidate}^{{commit}}"],
+      capture_output=True,
+      text=True,
+      env=ENV,
+    )
+    if result.returncode == 0:
+      return result.stdout.strip()
+  raise SourcePreparationError(f"Unable to resolve source ref: {requested_ref}")
+
+
+def prepare_submission_source(
+  *,
+  submission_id: str,
+  username: str,
+  branch: str,
+  repo_dir: str = "",
+  repo_url: str = "",
+) -> dict[str, str]:
+  source_identity = repo_url or repo_dir or DEFAULT_REPO_DIR
+  cache_key = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
+  cache_path = SOURCE_CACHE_BASE / username / f"{cache_key}.git"
+  lock_path = SOURCE_CACHE_BASE / username / ".locks" / f"{cache_key}.lock"
+  run_path = RUNS_BASE / username / submission_id
+  temporary_run_path = run_path.with_name(f".{submission_id}.{uuid.uuid4().hex}.tmp")
+
+  lock_path.parent.mkdir(parents=True, exist_ok=True)
+  run_path.parent.mkdir(parents=True, exist_ok=True)
+  if run_path.exists():
+    raise SourcePreparationError(f"Run directory already exists: {run_path}")
+
+  try:
+    with lock_path.open("a+") as lock_file:
+      fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+      if cache_path.exists():
+        _run_source_command(
+          ["git", "--git-dir", str(cache_path), "remote", "set-url", "origin", source_identity]
+        )
+        _run_source_command(
+          ["git", "--git-dir", str(cache_path), "fetch", "--prune", "origin"]
+        )
+      else:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_source_command(
+          ["git", "clone", "--mirror", "--", source_identity, str(cache_path)]
+        )
+
+      source_commit = _resolve_source_commit(cache_path, branch)
+      _run_source_command(
+        [
+          "git",
+          "clone",
+          "--no-hardlinks",
+          "--no-checkout",
+          "--",
+          str(cache_path),
+          str(temporary_run_path),
+        ]
+      )
+      _run_source_command(
+        ["git", "-C", str(temporary_run_path), "checkout", "--detach", source_commit]
+      )
+      _run_source_command(
+        ["git", "-C", str(temporary_run_path), "remote", "remove", "origin"]
+      )
+      os.replace(temporary_run_path, run_path)
+  except (OSError, SourcePreparationError):
+    shutil.rmtree(temporary_run_path, ignore_errors=True)
+    raise
+
+  return {
+    "source_identity": source_identity,
+    "source_commit": source_commit,
+    "run_path": str(run_path),
+  }
+
+
+def get_submission_artifact_paths(submission_id: str, username: str) -> dict[str, Path]:
+  script_path = GENERATED_SCRIPTS_DIR / submission_id / "job.sh"
+  log_root = NAS_LOGS_DIR / username if username else NAS_LOGS_DIR
+  log_path = log_root / submission_id / "slurm_%j.out"
+  return {"script_path": script_path, "log_path": log_path}
+
+
+def _write_script_atomic(script_path: Path, content: str) -> None:
+  script_path.parent.mkdir(parents=True, exist_ok=False)
+  file_descriptor, temporary_name = tempfile.mkstemp(
+    dir=script_path.parent,
+    prefix=".job-",
+    suffix=".tmp",
+    text=True,
+  )
+  temporary_path = Path(temporary_name)
+  try:
+    with os.fdopen(file_descriptor, "w") as stream:
+      stream.write(content)
+      stream.flush()
+      os.fsync(stream.fileno())
+    temporary_path.chmod(0o755)
+    os.replace(temporary_path, script_path)
+  finally:
+    temporary_path.unlink(missing_ok=True)
 
 
 def generate_script(
@@ -53,45 +567,71 @@ def generate_script(
     branch: str = "main",
     repo_dir: str = "",
     repo_url: str = "",
+    mem: str = "",
+    venv: str = "",
+    username: str = "",
+    submission_id: Optional[str] = None,
+    run_dir: str = "",
 ) -> Path:
     """動態產生 sbatch script，回傳路徑"""
-    GENERATED_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    submission_id = submission_id or uuid.uuid4().hex
+    artifact_paths = get_submission_artifact_paths(submission_id, username)
+    script_path = artifact_paths["script_path"]
+    log_path = artifact_paths["log_path"]
+    log_path.parent.mkdir(parents=True, exist_ok=False)
 
     nodelist_line = f"#SBATCH --nodelist={nodelist}" if nodelist else ""
-    work_dir = repo_dir or DEFAULT_REPO_DIR
+    mem_line = f"#SBATCH --mem={mem}" if mem else ""
 
-    if repo_url:
+    # 決定 work_dir：優先用 repo_dir，否則從 repo_url 推斷，最後 fallback DEFAULT_REPO_DIR
+    if repo_dir:
+        work_dir = repo_dir
+    elif repo_url and username:
+        repo_name = repo_url.rstrip("/").split("/")[-1].removesuffix(".git")
+        work_dir = str(SLURMJOB_BASE / username / repo_name)
+    else:
+        work_dir = DEFAULT_REPO_DIR
+
+    venv_activate = render_job_environment(venv)
+
+    if run_dir:
+      git_sync = f"\ncd {shlex.quote(run_dir)}\n"
+    elif repo_url:
+        if branch == "main":
+            # Auto-detect default branch from remote
+            branch_cmd = "BRANCH=$(git remote show origin 2>/dev/null | sed -n 's/.*HEAD branch: //p'); BRANCH=${BRANCH:-main}"
+        else:
+            branch_cmd = f"BRANCH={branch}"
         git_sync = f"""
 if [ ! -d "{work_dir}/.git" ]; then
     git clone {repo_url} {work_dir}
 fi
 cd {work_dir}
-git fetch origin
-git checkout {branch}
-git pull origin {branch}
+git config --local --add safe.directory '{work_dir}'
+{branch_cmd}
+flock -w 60 .git/config sh -c "git fetch origin && git checkout $BRANCH && git pull origin $BRANCH"
 """
     else:
         git_sync = f"""
 cd {work_dir}
-git pull origin {branch}
+git config --local --add safe.directory '{work_dir}'
+flock -w 60 .git/config git pull origin {branch}
 """
 
     script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --gres=gpu:{gpu}
 #SBATCH --cpus-per-task=4
-#SBATCH --output=/tmp/slurm_{job_name}_%j.out
-#SBATCH --time=02:00:00
+#SBATCH --output={str(log_path)}
 {nodelist_line}
-{VENV_ACTIVATE}
+{mem_line}
+set -e
+{venv_activate}
 {git_sync}
 {command}
 """
 
-    # 用 job_name 命名，方便識別
-    script_path = GENERATED_SCRIPTS_DIR / f"{job_name}.sh"
-    script_path.write_text(script)
-    script_path.chmod(0o755)
+    _write_script_atomic(script_path, script)
     return script_path
 
 
@@ -104,17 +644,53 @@ def submit_job(
     branch: str = "main",
     repo_dir: str = "",
     repo_url: str = "",
+    mem: str = "",
+    venv: str = "",
+    username: str = "",
 ) -> dict:
     """提交 sbatch job。可指定現有 script_path 或直接給 command 動態產生"""
+    submission_id = uuid.uuid4().hex
+    source_metadata: dict[str, str] = {}
     if command:
         name = job_name or "job"
-        path = generate_script(command, gpu=gpu, job_name=name, nodelist=nodelist, branch=branch, repo_dir=repo_dir, repo_url=repo_url)
+        try:
+            source_metadata = prepare_submission_source(
+                submission_id=submission_id,
+                username=username,
+                branch=branch,
+                repo_dir=repo_dir,
+                repo_url=repo_url,
+            )
+            path = generate_script(
+                command,
+                gpu=gpu,
+                job_name=name,
+                nodelist=nodelist,
+                branch=branch,
+                repo_dir=repo_dir,
+                repo_url=repo_url,
+                mem=mem,
+                venv=venv,
+                username=username,
+                submission_id=submission_id,
+                run_dir=source_metadata["run_path"],
+            )
+        except (OSError, SourcePreparationError, ValueError) as exc:
+            return {
+                "success": False,
+                "submission_id": submission_id,
+                "error": f"Source preparation failed: {exc}",
+            }
     elif script_path:
         if not Path(script_path).exists():
-            return {"success": False, "error": f"Script not found: {script_path}"}
+            return {
+                "success": False,
+                "submission_id": submission_id,
+                "error": f"Script not found: {script_path}",
+            }
         path = Path(script_path)
     else:
-        return {"success": False, "error": "Must provide either command or script_path"}
+        return {"success": False, "submission_id": submission_id, "error": "Must provide either command or script_path"}
 
     cmd = [SBATCH]
     if gpu and not command:  # command 模式已寫在 script 裡
@@ -128,8 +704,18 @@ def submit_job(
     stdout, stderr, rc = run_cmd(cmd)
     if rc == 0:
         job_id = stdout.split()[-1]
-        return {"success": True, "job_id": job_id, "message": stdout, "script": str(path)}
-    return {"success": False, "error": stderr}
+        log_path = get_submission_artifact_paths(submission_id, username)["log_path"]
+        return {
+            "success": True,
+            "submission_id": submission_id,
+            "job_id": job_id,
+            "message": stdout,
+            "script": str(path),
+            "script_path": str(path),
+            "log_path": str(log_path).replace("%j", job_id),
+            **source_metadata,
+        }
+    return {"success": False, "submission_id": submission_id, "error": stderr}
 
 
 def parse_queue_output(stdout: str) -> list[dict]:
@@ -147,14 +733,173 @@ def parse_queue_output(stdout: str) -> list[dict]:
                 "user": parts[2],
                 "state": parts[3],
                 "time": parts[4],
-                "nodes": parts[5] if len(parts) > 5 else "",
+                "gres": parts[5] if len(parts) > 5 else "",
+                "nodes": parts[6] if len(parts) > 6 else "",
+                "req_nodes": parts[7] if len(parts) > 7 else "",
             })
     return jobs
 
 
+def get_gpu_alloc() -> dict:
+    """計算每台節點已分配的 GPU 數量"""
+    # 從 sinfo 取得每台節點的 GPU 總數
+    stdout, _, rc = run_cmd([SINFO, "-N", "-o", "%N %G"])
+    node_total = {}
+    if rc == 0:
+        for line in stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                node = parts[0]
+                m = __import__('re').search(r'gpu:(\d+)', parts[1])
+                node_total[node] = int(m.group(1)) if m else 0
+
+    # 從 squeue 取得 RUNNING job 的 GPU 分配
+    stdout, _, rc = run_cmd([SQUEUE, "-t", "RUNNING", "-o", "%N %b"])
+    node_alloc = {n: 0 for n in node_total}
+    if rc == 0:
+        for line in stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                node = parts[0]
+                m = __import__('re').search(r'gpu:(\d+)', parts[1])
+                if m and node in node_alloc:
+                    node_alloc[node] += int(m.group(1))
+
+    return {
+        node: {"alloc": node_alloc.get(node, 0), "total": total}
+        for node, total in node_total.items()
+    }
+
+
+def _get_node_gpu_status(node: str) -> list[dict]:
+    """SSH into a node and query nvidia-smi for GPU details."""
+    hostname = socket.gethostname()
+    is_local = (node == hostname or node == hostname.split('.')[0])
+
+    nvidia_cmd = "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
+    proc_cmd = "nvidia-smi --query-compute-apps=gpu_bus_id,pid,process_name,used_memory --format=csv,noheader,nounits"
+    bus_cmd = "nvidia-smi --query-gpu=index,gpu_bus_id --format=csv,noheader"
+
+    if is_local:
+        shell_cmd = f"{nvidia_cmd} && echo '---PROCS---' && {proc_cmd} && echo '---BUS---' && {bus_cmd}"
+    else:
+        shell_cmd = f"ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {node} \"{nvidia_cmd} && echo '---PROCS---' && {proc_cmd} && echo '---BUS---' && {bus_cmd}\""
+
+    try:
+        result = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=8)
+        if result.returncode != 0:
+            return []
+    except (subprocess.TimeoutExpired, Exception):
+        return []
+
+    output = result.stdout.strip()
+    parts = output.split('---PROCS---')
+    gpu_section = parts[0].strip()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    bus_parts = rest.split('---BUS---')
+    proc_section = bus_parts[0].strip()
+    bus_section = bus_parts[1].strip() if len(bus_parts) > 1 else ""
+
+    # Parse bus_id to index mapping
+    bus_to_idx = {}
+    for line in bus_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 2:
+            bus_to_idx[cols[1]] = int(cols[0])
+
+    # Collect all PIDs from proc section, then batch-query usernames via ps
+    all_pids = set()
+    for line in proc_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 4:
+            all_pids.add(cols[1].strip())
+
+    pid_to_user = {}
+    if all_pids:
+        ps_cmd_str = f"ps -o pid=,user= -p {','.join(all_pids)}"
+        if is_local:
+            ps_shell = ps_cmd_str
+        else:
+            ps_shell = f"ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {node} \"{ps_cmd_str}\""
+        try:
+            ps_result = subprocess.run(ps_shell, shell=True, capture_output=True, text=True, timeout=5)
+            for line in ps_result.stdout.strip().splitlines():
+                fields = line.strip().split()
+                if len(fields) >= 2:
+                    pid_to_user[fields[0]] = fields[1]
+        except Exception:
+            pass
+
+    # Parse processes
+    gpu_procs: dict[int, list[dict]] = {}
+    for line in proc_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 4:
+            bus_id = cols[0]
+            idx = bus_to_idx.get(bus_id, -1)
+            pid = cols[1].strip()
+            proc_name = cols[2].split('/')[-1]  # just the binary name
+            user = pid_to_user.get(pid, "")
+            mem = int(cols[3]) if cols[3].strip().isdigit() else 0
+            if idx not in gpu_procs:
+                gpu_procs[idx] = []
+            gpu_procs[idx].append({"name": proc_name, "user": user, "mem_mb": mem})
+
+    # Parse GPU info
+    gpus = []
+    for line in gpu_section.splitlines():
+        cols = [c.strip() for c in line.split(',')]
+        if len(cols) >= 5:
+            idx = int(cols[0])
+            procs = gpu_procs.get(idx, [])
+            # Summarize processes: "user/process (XXXMB)"
+            proc_summary = ", ".join(
+                f"{p['user']}/{p['name']} ({p['mem_mb']}MB)" if p['user'] else f"{p['name']} ({p['mem_mb']}MB)"
+                for p in sorted(procs, key=lambda x: -x['mem_mb'])
+            ) if procs else ""
+            gpus.append({
+                "index": idx,
+                "name": cols[1],
+                "mem_used_mb": int(cols[2]),
+                "mem_total_mb": int(cols[3]),
+                "util_pct": int(cols[4]),
+                "processes": proc_summary,
+            })
+    return gpus
+
+
+def get_gpu_status() -> dict:
+    """Get real-time GPU status from all cluster nodes via nvidia-smi."""
+    # Get node list from sinfo
+    stdout, _, rc = run_cmd([SINFO, "-N", "-o", "%N %T", "--noheader"])
+    nodes = {}
+    if rc == 0:
+        for line in stdout.splitlines():
+            parts = line.split()
+            if parts:
+                nodes[parts[0]] = parts[1] if len(parts) > 1 else "unknown"
+
+    # Query all nodes in parallel
+    results = {}
+    lock = threading.Lock()
+
+    def query_node(node, state):
+        gpus = _get_node_gpu_status(node)
+        with lock:
+            results[node] = {"state": state, "gpus": gpus}
+
+    threads = [threading.Thread(target=query_node, args=(n, s)) for n, s in nodes.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    return results
+
+
 def get_queue(user: Optional[str] = None) -> str:
     """查看 job queue"""
-    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %N"]
+    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %10b %N %v"]
     if user:
         cmd += ["-u", user]
     stdout, stderr, rc = run_cmd(cmd)
@@ -163,7 +908,7 @@ def get_queue(user: Optional[str] = None) -> str:
 
 def get_queue_json(user: Optional[str] = None) -> list[dict]:
     """查看 job queue，回傳結構化 JSON"""
-    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %N"]
+    cmd = [SQUEUE, "-o", "%.8i %15j %10u %10T %10M %10b %N %v"]
     if user:
         cmd += ["-u", user]
     stdout, stderr, rc = run_cmd(cmd)
@@ -217,9 +962,11 @@ def list_scripts() -> list[str]:
 # ─── MCP Server ───────────────────────────────────────────────────────────────
 
 def run_mcp_server():
-    from mcp.server.fastmcp import FastMCP
+    raise RuntimeError("Embedded MCP is disabled; run mcp_server.py instead")
 
-    mcp = FastMCP("Slurm Manager")
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("Slurm Manager")
 
     @mcp.tool()
     def slurm_submit(
@@ -230,6 +977,8 @@ def run_mcp_server():
         branch: str = "main",
         repo_dir: str = "",
         repo_url: str = "",
+        mem: str = "",
+        venv: str = "",
     ) -> str:
         """
         提交 Slurm job。自動產生 sbatch script 並提交。
@@ -240,6 +989,8 @@ def run_mcp_server():
         branch: git branch（預設 main）
         repo_dir: repo 在節點上的本地路徑（選填，預設 /storage/SSD2/hank/gpu_training）
         repo_url: git remote URL，若 repo_dir 不存在會自動 clone（選填）
+        mem: 記憶體大小，例如 32G（選填，預設 4GB/CPU）
+        venv: venv 路徑，例如 /storage/SSD2/alice/venv（選填）
         """
         result = submit_job(
             command=command,
@@ -249,6 +1000,8 @@ def run_mcp_server():
             branch=branch,
             repo_dir=repo_dir,
             repo_url=repo_url,
+            mem=mem,
+            venv=venv,
         )
         if result["success"]:
             return f"✓ Job submitted! Job ID: {result['job_id']}\nScript: {result['script']}"
@@ -364,6 +1117,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .toast.show { opacity: 1; transform: translateY(0); }
     .toast.success { background: #14532d; color: #4ade80; border: 1px solid #166534; }
     .toast.error { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
+
+    /* Stats */
+    .stat-card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 16px 20px; }
+    .stat-number { font-size: 28px; font-weight: 700; color: #a78bfa; margin-bottom: 4px; }
+    .stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
+    .stat-row { margin-top: 10px; font-size: 12px; color: #64748b; display: flex; justify-content: space-between; border-top: 1px solid #2d3148; padding-top: 8px; }
+
+    /* GPU status table */
+    .gpu-util-bar { display: inline-block; width: 60px; height: 6px; background: #0f1117; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
+    .gpu-util-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #22c55e, #4ade80); }
+    .gpu-util-fill.high { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+    .gpu-util-fill.critical { background: linear-gradient(90deg, #dc2626, #f87171); }
+    .vram-text { font-size: 12px; color: #94a3b8; }
+    .vram-text .used { color: #a78bfa; font-weight: 600; }
+    .proc-text { font-size: 11px; color: #64748b; }
+    .gpu-node-offline { color: #475569; font-style: italic; }
+
+    /* Log modal */
+    .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+    .modal-backdrop.show { display: flex; }
+    .modal { background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; width: 800px; max-width: 95vw; max-height: 80vh; display: flex; flex-direction: column; }
+    .modal-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid #2d3148; }
+    .modal-title { font-size: 14px; font-weight: 600; color: #a78bfa; }
+    .modal-close { background: none; border: none; color: #64748b; font-size: 20px; cursor: pointer; line-height: 1; }
+    .modal-close:hover { color: #e2e8f0; }
+    .modal-body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+    .log-content { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; color: #94a3b8; white-space: pre-wrap; word-break: break-all; line-height: 1.6; }
+    .log-file { font-size: 11px; color: #475569; margin-bottom: 12px; }
   </style>
 </head>
 <body>
@@ -379,11 +1160,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div>
+      <div class="section-title">GPU Status (Real-time)</div>
+      <div class="queue-wrap">
+        <table>
+          <thead><tr><th>Node</th><th>GPU</th><th>Model</th><th>VRAM Usage</th><th>Utilization</th><th>Processes</th></tr></thead>
+          <tbody id="gpu-status-body"><tr><td colspan="6" class="empty-state">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div>
       <div class="section-title">Job Queue</div>
       <div class="queue-wrap">
         <table>
-          <thead><tr><th>Job ID</th><th>Name</th><th>User</th><th>State</th><th>Time</th><th>Node</th><th></th></tr></thead>
+          <thead><tr><th>Job ID</th><th>Name</th><th>User</th><th>State</th><th>Time</th><th>GPU</th><th>Node</th><th>Requested</th><th></th></tr></thead>
           <tbody id="queue-body"><tr><td colspan="7" class="empty-state">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Statistics (Last 30 Days)</div>
+      <div class="cluster-grid" id="stats-grid"><div class="node-card"><div class="node-name" style="color:#475569">Loading...</div></div></div>
+    </div>
+
+    <div>
+      <div class="section-title">Job History</div>
+      <div class="queue-wrap">
+        <table>
+          <thead><tr><th>Job ID</th><th>Name</th><th>User</th><th>GPU</th><th>Node</th><th>Branch</th><th>Submitted</th><th></th></tr></thead>
+          <tbody id="history-body"><tr><td colspan="8" class="empty-state">Loading...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -395,6 +1201,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="form-full">
             <label>Command</label>
             <input id="f-command" type="text" placeholder="python3 -u train.py --lr 0.001 --epochs 50">
+          </div>
+          <div>
+            <label>Username <span style="color:#f87171">*</span></label>
+            <input id="f-username" type="text" placeholder="alice">
           </div>
           <div>
             <label>Job Name</label>
@@ -424,11 +1234,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <label>Repo URL (optional, auto-clone if dir missing)</label>
             <input id="f-repourl" type="text" placeholder="git@github.com:org/repo.git">
           </div>
+          <div class="form-full">
+            <label>Venv</label>
+            <select id="f-venv" onchange="toggleCustomVenv()">
+              <option value="">-- None (no venv) --</option>
+            </select>
+            <input id="f-venv-custom" type="text" placeholder="/storage/SSD2/alice/venv" style="display:none;margin-top:6px">
+          </div>
         </div>
         <button class="btn-submit" id="btn-submit" onclick="submitJob()">Submit Job</button>
       </div>
     </div>
   </main>
+
+  <!-- Log Modal -->
+  <div class="modal-backdrop" id="log-modal" onclick="closeLogModal(event)">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" id="modal-title">Job Log</div>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="log-file" id="log-file"></div>
+        <div class="log-content" id="log-content">Loading...</div>
+      </div>
+    </div>
+  </div>
 
   <div class="toast" id="toast"></div>
 
@@ -441,29 +1272,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
     }
 
-    function nodeCardHTML(node) {
+    function nodeCardHTML(node, gpuData) {
       const state = node.state.toLowerCase();
       const stateClass = state.includes('idle') ? 'state-idle' :
                          state.includes('alloc') ? 'state-alloc' :
                          state.includes('mix') ? 'state-mix' : 'state-down';
       const cardClass = state.includes('idle') ? 'idle' : 'busy';
 
-      // parse GPU count from gres like "gpu:2" or "gpu:a6000:2"
-      const gpuMatch = node.gres.match(/gpu:(\d+)$/i) || node.gres.match(/gpu:[^:]+:(\d+)/i);
-      const gpuCount = gpuMatch ? gpuMatch[1] : node.gres.replace('gpu:', '') || '?';
-      const gpuModel = 'GPU';
+      // GPU alloc from /gpu-alloc endpoint
+      const gpuInfo = (gpuData || {})[node.name] || {};
+      const gpuAlloc = gpuInfo.alloc || 0;
+      const gpuTotal = gpuInfo.total || 0;
+      const gpuPct = gpuTotal > 0 ? Math.round(gpuAlloc / gpuTotal * 100) : 0;
 
       // parse CPU allocated/total from "A/I/O/T"
       const cpuParts = node.cpus.split('/');
       const cpuAlloc = parseInt(cpuParts[0]) || 0;
       const cpuTotal = parseInt(cpuParts[3]) || 1;
-      const cpuPct = Math.round(cpuAlloc / cpuTotal * 100);
 
       return `
         <div class="node-card ${cardClass}">
           <div class="node-name">${node.name}</div>
-          <div class="node-meta">GPU: ${gpuModel} × ${gpuCount} &nbsp;|&nbsp; CPU: ${cpuAlloc}/${cpuTotal}</div>
-          <div class="gpu-bar-wrap"><div class="gpu-bar ${cpuPct > 80 ? 'full' : ''}" style="width:${cpuPct}%"></div></div>
+          <div class="node-meta">GPU: ${gpuAlloc}/${gpuTotal} allocated &nbsp;|&nbsp; CPU: ${cpuAlloc}/${cpuTotal}</div>
+          <div class="gpu-bar-wrap"><div class="gpu-bar ${gpuPct > 80 ? 'full' : ''}" style="width:${gpuPct}%"></div></div>
           <span class="node-state ${stateClass}">${node.state}</span>
         </div>`;
     }
@@ -471,28 +1302,138 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function queueRowHTML(job) {
       const badgeClass = job.state === 'RUNNING' ? 'badge-running' :
                          job.state === 'PENDING' ? 'badge-pending' : 'badge-other';
+      const gpuMatch = job.gres ? job.gres.match(/gpu:(\d+)/) : null;
+      const gpuCount = gpuMatch ? gpuMatch[1] : '—';
       return `<tr>
         <td style="color:#94a3b8">${job.job_id}</td>
         <td style="color:#e2e8f0;font-weight:600">${job.name}</td>
         <td style="color:#94a3b8">${job.user}</td>
         <td><span class="badge ${badgeClass}">${job.state}</span></td>
         <td style="color:#64748b">${job.time}</td>
+        <td style="color:#a78bfa;font-weight:600">${gpuCount}</td>
         <td style="color:#64748b">${job.nodes || '—'}</td>
-        <td><button onclick="cancelJob('${job.job_id}')" style="background:none;border:1px solid #3b3460;color:#94a3b8;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">cancel</button></td>
+        <td style="color:#475569;font-size:12px">${job.req_nodes && job.req_nodes !== 'N/A' ? job.req_nodes : '—'}</td>
+        <td style="display:flex;gap:4px">
+          <button onclick="showLog('${job.job_id}','${job.name}')" style="background:none;border:1px solid #1e3a5f;color:#60a5fa;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">log</button>
+          <button onclick="cancelJob('${job.job_id}')" style="background:none;border:1px solid #3b3460;color:#94a3b8;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">cancel</button>
+        </td>
       </tr>`;
+    }
+
+    async function refreshStats() {
+      try {
+        const [statsRes, histRes] = await Promise.all([fetch('/stats'), fetch('/history?limit=50')]);
+        const stats = await statsRes.json();
+        const hist = await histRes.json();
+
+        // Stats cards
+        const byUser = stats.by_user || [];
+        let statsHtml = `
+          <div class="stat-card">
+            <div class="stat-number">${stats.total_jobs}</div>
+            <div class="stat-label">Total Jobs</div>
+            <div class="stat-row"><span>GPU hours requested</span><span style="color:#a78bfa">${stats.total_gpu_requested}</span></div>
+          </div>`;
+        byUser.forEach(u => {
+          statsHtml += `
+            <div class="stat-card">
+              <div class="stat-number">${u.jobs}</div>
+              <div class="stat-label">${u.username}</div>
+              <div class="stat-row"><span>Total GPU requested</span><span style="color:#a78bfa">${u.total_gpu}</span></div>
+            </div>`;
+        });
+        document.getElementById('stats-grid').innerHTML = statsHtml;
+
+        // History table
+        const jobs = hist.jobs || [];
+        document.getElementById('history-body').innerHTML = jobs.length
+          ? jobs.map(j => `<tr>
+              <td style="color:#94a3b8">${j.job_id}</td>
+              <td style="color:#e2e8f0;font-weight:600">${j.job_name}</td>
+              <td style="color:#94a3b8">${j.username}</td>
+              <td style="color:#a78bfa;font-weight:600">${j.gpu}</td>
+              <td style="color:#64748b">${j.nodelist || '—'}</td>
+              <td style="color:#64748b">${j.branch}</td>
+              <td style="color:#475569;font-size:12px">${j.submit_time}</td>
+              <td><button onclick="showLog('${j.job_id}','${j.job_name}')" style="background:none;border:1px solid #1e3a5f;color:#60a5fa;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">log</button></td>
+            </tr>`).join('')
+          : '<tr><td colspan="8" class="empty-state">No history yet</td></tr>';
+      } catch(e) {}
+    }
+
+    function toggleCustomVenv() {
+      const sel = document.getElementById('f-venv');
+      const custom = document.getElementById('f-venv-custom');
+      custom.style.display = sel.value === '__custom__' ? 'block' : 'none';
+      if (sel.value !== '__custom__') custom.value = '';
+    }
+
+    function getVenvValue() {
+      const sel = document.getElementById('f-venv');
+      if (sel.value === '__custom__') return document.getElementById('f-venv-custom').value.trim();
+      return sel.value;
+    }
+
+    async function loadVenvs() {
+      try {
+        const res = await fetch('/venvs');
+        const data = await res.json();
+        const sel = document.getElementById('f-venv');
+        (data.venvs || []).forEach(v => {
+          const opt = document.createElement('option');
+          opt.value = v.name;
+          opt.textContent = v.name + (v.exists ? '' : ' (missing)');
+          sel.appendChild(opt);
+        });
+        const custom = document.createElement('option');
+        custom.value = '__custom__';
+        custom.textContent = 'Custom path...';
+        sel.appendChild(custom);
+      } catch(e) {}
+    }
+
+    function renderGpuStatus(data) {
+      let rows = '';
+      const nodeNames = Object.keys(data).sort();
+      for (const node of nodeNames) {
+        const info = data[node];
+        if (!info.gpus || info.gpus.length === 0) {
+          rows += `<tr><td style="color:#c4b5fd;font-weight:600">${node}</td><td colspan="5" class="gpu-node-offline">${info.state === 'down' || info.state === 'down*' ? 'Node down' : 'No GPU data'}</td></tr>`;
+          continue;
+        }
+        info.gpus.forEach((gpu, i) => {
+          const memPct = gpu.mem_total_mb > 0 ? Math.round(gpu.mem_used_mb / gpu.mem_total_mb * 100) : 0;
+          const memUsedGB = (gpu.mem_used_mb / 1024).toFixed(1);
+          const memTotalGB = (gpu.mem_total_mb / 1024).toFixed(0);
+          const utilClass = gpu.util_pct > 80 ? 'critical' : gpu.util_pct > 40 ? 'high' : '';
+          rows += `<tr>
+            <td style="color:#c4b5fd;font-weight:600">${i === 0 ? node : ''}</td>
+            <td style="color:#94a3b8">GPU ${gpu.index}</td>
+            <td style="color:#e2e8f0">${gpu.name}</td>
+            <td><span class="vram-text"><span class="used">${memUsedGB}</span> / ${memTotalGB} GB</span></td>
+            <td><div class="gpu-util-bar"><div class="gpu-util-fill ${utilClass}" style="width:${gpu.util_pct}%"></div></div> ${gpu.util_pct}%</td>
+            <td class="proc-text">${gpu.processes || '—'}</td>
+          </tr>`;
+        });
+      }
+      document.getElementById('gpu-status-body').innerHTML = rows || '<tr><td colspan="6" class="empty-state">No nodes found</td></tr>';
     }
 
     async function refresh() {
       try {
-        const [clusterRes, queueRes] = await Promise.all([
-          fetch('/cluster'), fetch('/queue')
+        const [clusterRes, queueRes, gpuRes, gpuStatusRes] = await Promise.all([
+          fetch('/cluster'), fetch('/queue'), fetch('/gpu-alloc'), fetch('/gpu-status')
         ]);
         const clusterData = await clusterRes.json();
         const queueData = await queueRes.json();
+        const gpuData = await gpuRes.json();
+        const gpuStatusData = await gpuStatusRes.json();
 
         const nodes = parseCluster(clusterData.output || '');
         document.getElementById('cluster-grid').innerHTML =
-          nodes.length ? nodes.map(nodeCardHTML).join('') : '<div style="color:#475569;padding:16px">No nodes found</div>';
+          nodes.length ? nodes.map(n => nodeCardHTML(n, gpuData)).join('') : '<div style="color:#475569;padding:16px">No nodes found</div>';
+
+        renderGpuStatus(gpuStatusData);
 
         const jobs = queueData.jobs || [];
         document.getElementById('queue-body').innerHTML =
@@ -508,21 +1449,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function submitJob() {
       const command = document.getElementById('f-command').value.trim();
+      const username = document.getElementById('f-username').value.trim();
       if (!command) { showToast('Command is required', 'error'); return; }
+      if (!username) { showToast('Username is required', 'error'); return; }
       const btn = document.getElementById('btn-submit');
       btn.disabled = true; btn.textContent = 'Submitting...';
       try {
         const res = await fetch('/submit', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Submission-Source': 'internal-ui'
+          },
           body: JSON.stringify({
             command,
+            username,
             job_name: document.getElementById('f-jobname').value || 'job',
             gpu: parseInt(document.getElementById('f-gpu').value),
             branch: document.getElementById('f-branch').value || 'main',
             nodelist: document.getElementById('f-nodelist').value,
             repo_dir: document.getElementById('f-repodir').value,
             repo_url: document.getElementById('f-repourl').value,
+            venv: getVenvValue(),
           })
         });
         const data = await res.json();
@@ -552,50 +1500,207 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       setTimeout(() => { t.className = 'toast'; }, 3000);
     }
 
+    async function showLog(jobId, jobName) {
+      document.getElementById('modal-title').textContent = `Log — ${jobName} (${jobId})`;
+      document.getElementById('log-file').textContent = '';
+      document.getElementById('log-content').textContent = 'Loading...';
+      document.getElementById('log-modal').classList.add('show');
+      try {
+        const res = await fetch('/logs/' + jobId);
+        const data = await res.json();
+        document.getElementById('log-file').textContent = data.file || '';
+        document.getElementById('log-content').textContent = data.log || '(empty)';
+      } catch(e) {
+        document.getElementById('log-content').textContent = 'Error loading log';
+      }
+    }
+
+    function closeModal() {
+      document.getElementById('log-modal').classList.remove('show');
+    }
+
+    function closeLogModal(e) {
+      if (e.target === document.getElementById('log-modal')) closeModal();
+    }
+
     refresh();
+    refreshStats();
+    loadVenvs();
     setInterval(refresh, 5000);
+    setInterval(refreshStats, 30000);
   </script>
 </body>
 </html>"""
 
 
-def run_http_server(port: int = 8765):
-    from fastapi import FastAPI, HTTPException
+def create_http_app():
+    from fastapi import FastAPI, Header, HTTPException
     from fastapi.responses import HTMLResponse
-    from pydantic import BaseModel
-    import uvicorn
+    from pydantic import BaseModel, ConfigDict
 
     app = FastAPI(title="Slurm API", description="Submit and manage Slurm jobs")
 
     class SubmitRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
         command: str                  # e.g. "python3 -u train.py --lr 0.001"
+        username: str = ""            # legacy headerless HTTP defaults to hank; MCP must provide it
         gpu: int = 1
         job_name: str = "job"
         nodelist: str = ""
         branch: str = "main"
-        repo_dir: str = ""           # e.g. "/storage/SSD2/alice/my_project"
+        repo_dir: str = ""           # must be under /storage/SSD2/slurmjob/<username>/
         repo_url: str = ""           # e.g. "git@github.com:org/repo.git"
-        script_path: str = ""        # legacy: 直接指定現有 script
+        mem: str = ""                # e.g. "32G", "16G" (預設用 DefMemPerCPU)
+        venv: str = ""               # e.g. "/storage/SSD2/alice/venv"
 
     @app.post("/submit")
-    def submit(req: SubmitRequest):
+    def submit(
+        req: SubmitRequest,
+        submission_source: str = Header(default="", alias="X-Submission-Source"),
+    ):
+        source = submission_source.strip().lower()
+        if not source:
+          source = "manual-http"
+        elif source not in {"mcp", "internal-ui"}:
+          raise HTTPException(status_code=403, detail="unsupported submission source")
+
+        username = req.username.strip()
+        if source == "manual-http" and not username:
+          username = LEGACY_DEFAULT_USERNAME
+        command = req.command.strip()
+        venv = req.venv.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="username is required")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
+            raise HTTPException(status_code=400, detail="username contains unsupported characters")
+        if not command:
+            raise HTTPException(status_code=400, detail="command is required")
+        if not venv and source != "manual-http":
+            raise HTTPException(status_code=400, detail="venv is required")
+        node_defaults = {}
+        if not venv:
+          try:
+            node_defaults = get_legacy_node_venvs()
+          except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid default venv configuration: {exc}") from exc
+          if req.nodelist and req.nodelist not in node_defaults:
+            raise HTTPException(status_code=400, detail="No default venv for requested nodelist; specify venv explicitly")
+        if not 1 <= req.gpu <= 7:
+            raise HTTPException(status_code=400, detail="gpu must be between 1 and 7")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", req.job_name):
+            raise HTTPException(status_code=400, detail="job_name contains unsupported characters")
+
+        user_base = SLURMJOB_BASE / username
+
+        # Determine repo_dir: default to user base if not specified
+        if req.repo_dir:
+            repo_dir_path = Path(req.repo_dir).resolve()
+            user_base_resolved = user_base.resolve()
+            # Enforce repo_dir must be under /storage/SSD2/slurmjob/<username>/
+            try:
+                repo_dir_path.relative_to(user_base_resolved)
+            except ValueError:
+              # Exact historical demo source only; not arbitrary filesystem access.
+              if not (source == "manual-http" and str(repo_dir_path) == DEFAULT_REPO_DIR):
+                raise HTTPException(
+                  status_code=400,
+                  detail=f"repo_dir must be under {user_base}/ (got: {req.repo_dir})"
+                )
+            repo_dir = str(repo_dir_path)
+        else:
+            repo_dir = ""  # let generate_script infer from repo_url + username
+
         result = submit_job(
-            command=req.command or None,
-            script_path=req.script_path or None,
+            command=command,
             gpu=req.gpu,
             job_name=req.job_name or None,
             nodelist=req.nodelist or None,
             branch=req.branch,
-            repo_dir=req.repo_dir,
+            repo_dir=repo_dir,
             repo_url=req.repo_url,
+            mem=req.mem,
+            venv=venv,
+            username=username,
         )
         if not result["success"]:
             raise HTTPException(status_code=400, detail=result["error"])
+        result["submission_source"] = source
+        result["status"] = "submitted"
+        result["venv_policy"] = "explicit" if venv else "node-default"
+        result["requested_venv"] = venv
+        if node_defaults:
+          result["node_default_venvs"] = node_defaults
+        request_payload = json.dumps(
+          {
+            "command": command,
+            "username": username,
+            "gpu": req.gpu,
+            "job_name": req.job_name,
+            "nodelist": req.nodelist,
+            "branch": req.branch,
+            "repo_dir": repo_dir,
+            "repo_url": req.repo_url,
+            "mem": req.mem,
+            "venv": venv,
+            "venv_policy": result["venv_policy"],
+            "node_default_venvs": node_defaults,
+          },
+          sort_keys=True,
+        )
+        try:
+          record_submission(
+            submission_id=result["submission_id"],
+            job_id=result["job_id"],
+            username=username,
+            job_name=req.job_name or "job",
+            command=command,
+            gpu=req.gpu,
+            nodelist=req.nodelist or "",
+            repo_dir=repo_dir,
+            repo_url=req.repo_url,
+            branch=req.branch,
+            source_identity=result.get("source_identity", req.repo_url or repo_dir),
+            source_commit=result.get("source_commit", ""),
+            run_path=result.get("run_path", ""),
+            script_path=result.get("script_path", result.get("script", "")),
+            log_path=result.get("log_path", ""),
+            request_payload=request_payload,
+            status="submitted",
+            submission_source=source,
+          )
+        except (sqlite3.Error, OSError) as exc:
+          recovery_record = {
+            "submission_id": result["submission_id"],
+            "job_id": result["job_id"],
+            "status": "metadata_finalize_failed",
+            "error": str(exc),
+            "request_payload": request_payload,
+            "script_path": result.get("script_path", result.get("script", "")),
+            "log_path": result.get("log_path", ""),
+            "run_path": result.get("run_path", ""),
+          }
+          try:
+            recovery_path = write_recovery_record(recovery_record)
+          except OSError as recovery_exc:
+            recovery_path = f"unavailable: {recovery_exc}"
+          raise HTTPException(
+            status_code=500,
+            detail={**recovery_record, "recovery_path": recovery_path},
+          ) from exc
         return result
 
     @app.get("/queue")
     def queue(user: str = ""):
         return {"jobs": get_queue_json(user or None)}
+
+    @app.get("/health")
+    def health():
+      return {
+        "status": "ok",
+        "service": "slurm-api",
+        "version": SERVICE_VERSION,
+      }
 
     @app.get("/status/{job_id}")
     def status(job_id: str):
@@ -608,9 +1713,62 @@ def run_http_server(port: int = 8765):
             raise HTTPException(status_code=400, detail=result["error"])
         return result
 
+    @app.get("/history")
+    def history(limit: int = 100):
+        return {"jobs": get_history(limit)}
+
+    @app.get("/stats")
+    def stats():
+        return get_stats()
+
+    @app.get("/logs/{job_id}")
+    def logs(job_id: str):
+        submission = get_submission_by_job_id(job_id)
+        if not submission or not submission.get("log_path"):
+            return {"job_id": job_id, "log": f"(no log metadata found for job {job_id})"}
+        log_path = submission["log_path"]
+        try:
+            content = Path(log_path).read_text(errors="replace")
+            return {"job_id": job_id, "file": log_path, "log": content}
+        except OSError as exc:
+            return {"job_id": job_id, "file": log_path, "log": f"Error reading log: {exc}"}
+
     @app.get("/cluster")
     def cluster():
         return {"output": get_cluster_info()}
+
+    @app.get("/gpu-alloc")
+    def gpu_alloc():
+        return get_gpu_alloc()
+
+    @app.get("/gpu-status")
+    def gpu_status():
+        return get_gpu_status()
+
+    @app.get("/venvs")
+    def venvs():
+        return {"venvs": get_available_venvs()}
+
+    class CreateVenvRequest(BaseModel):
+        name: str
+        python_version: str = ""
+
+    @app.post("/venvs/create")
+    def create_venv(req: CreateVenvRequest):
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', req.name):
+            raise HTTPException(status_code=400, detail="Invalid venv name: use only letters, numbers, _ or -")
+        venv_path = VENVS_BASE / req.name
+        if venv_path.exists():
+            raise HTTPException(status_code=400, detail=f"Venv '{req.name}' already exists at {venv_path}")
+        python = req.python_version or "python3"
+        result = subprocess.run(
+            [python, "-m", "venv", str(venv_path)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=result.stderr)
+        return {"success": True, "name": req.name, "path": str(venv_path)}
 
     @app.get("/scripts")
     def scripts():
@@ -629,11 +1787,13 @@ def run_http_server(port: int = 8765):
                     "desc": "提交 job",
                     "body": {
                         "command": "要執行的指令 (必填), e.g. 'python3 -u train.py --lr 0.001'",
+                        "username": "使用者名稱 (必填), e.g. 'alice' → repo 放在 /storage/SSD2/slurmjob/alice/",
+                        "venv": "共享虛擬環境名稱或核准路徑 (必填)",
                         "gpu": "GPU 數量 (預設 1)",
                         "job_name": "job 名稱 (預設 job)",
                         "nodelist": "指定節點 (選填)",
                         "branch": "git branch (預設 main)",
-                        "repo_dir": "repo 路徑 (選填, 預設 /storage/SSD2/hank/gpu_training)",
+                        "repo_dir": "repo 路徑 (選填, 必須在 /storage/SSD2/slurmjob/<username>/ 底下)",
                         "repo_url": "git remote URL (選填)",
                     }
                 },
@@ -645,8 +1805,16 @@ def run_http_server(port: int = 8765):
             }
         }
 
-    print(f"Slurm HTTP API running at http://0.0.0.0:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    return app
+
+
+def run_http_server(host: str = "127.0.0.1", port: int = 8765):
+    import uvicorn
+
+    init_db()
+    app = create_http_app()
+    print(f"Slurm HTTP API running at http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -654,10 +1822,11 @@ def run_http_server(port: int = 8765):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--http", action="store_true", help="Run as HTTP server")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
     args = parser.parse_args()
 
     if args.http:
-        run_http_server(port=args.port)
+        run_http_server(host=args.host, port=args.port)
     else:
         run_mcp_server()

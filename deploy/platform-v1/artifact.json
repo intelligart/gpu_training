@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "artifact_version": "1.0.1",
+  "python_version": "3.10.12",
+  "release_root": "/opt/gpu-platform/releases/1.0.1",
+  "venv_root": "/opt/gpu-platform/venvs/1.0.0",
+  "requirements_lock": "deploy/platform-v1/requirements-service.lock",
+  "source_files": [
+    "mcp_server.py",
+    "slurm_server.py",
+    "onboarding.py"
+  ],
+  "services": {
+    "slurm-api": {
+      "unit": "deploy/platform-v1/systemd/slurm-api.service",
+      "bind": "127.0.0.1:8765"
+    },
+    "slurm-mcp": {
+      "unit": "deploy/platform-v1/systemd/slurm-mcp.service",
+      "bind": "192.168.51.48:8766"
+    }
+  },
+  "profiles": {
+    "trusted_vpn": {
+      "api_drop_in": "deploy/platform-v1/systemd/slurm-api-vpn-bind.conf",
+      "mcp_drop_in": "deploy/platform-v1/systemd/slurm-mcp-vpn-backend.conf",
+      "api_bind": "192.168.51.48:8765",
+      "mcp_bind": "192.168.51.48:8766",
+      "access": "full Dashboard/API including submit and cancel for trusted VPN users"
+    }
+  },
+  "gateway": {
+    "config": "deploy/platform-v1/nginx/gpu-platform.conf",
+    "bind": "127.0.0.1:8443",
+    "boundary": "optional future HTTPS gateway; v1 pilot uses the trusted private LAN MCP bind"
+  },
+  "state_paths": [
+    "/storage/SSD2/hank/gpu_training/slurm_history.db",
+    "/storage/Internal_NAS/logs",
+    "/storage/Internal_NAS/slurm-recovery",
+    "/storage/Internal_NAS/slurm-runs",
+    "/storage/Internal_NAS/slurm-source-cache"
+  ]
+}
