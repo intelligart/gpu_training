@@ -22,9 +22,20 @@ class SubmissionApiBoundaryTests(unittest.TestCase):
 
     @patch("slurm_server.record_submission")
     @patch("slurm_server.submit_job")
-    def test_missing_submission_source_is_rejected(self, submit_mock, record_mock):
+    def test_headerless_manual_submission_is_accepted_and_audited(self, submit_mock, record_mock):
+        submit_mock.return_value = {"success": True, "submission_id": "manual-1", "job_id": "123"}
         response = self.client.post("/submit", json=self.payload)
 
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["submission_source"], "manual-http")
+        self.assertEqual(response.json()["venv_policy"], "explicit")
+        submit_mock.assert_called_once()
+        self.assertEqual(record_mock.call_args.kwargs["submission_source"], "manual-http")
+
+    @patch("slurm_server.record_submission")
+    @patch("slurm_server.submit_job")
+    def test_unknown_source_is_rejected(self, submit_mock, record_mock):
+        response = self.client.post("/submit", json=self.payload, headers={"X-Submission-Source": "untrusted"})
         self.assertEqual(response.status_code, 403)
         submit_mock.assert_not_called()
         record_mock.assert_not_called()

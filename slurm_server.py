@@ -47,6 +47,60 @@ SERVICE_VERSION = os.environ.get("GPU_PLATFORM_VERSION", "development")
 # Shared venvs on NAS — 放在這個目錄下的子目錄會自動被偵測為可用 venv
 VENVS_BASE = Path("/storage/Internal_NAS/venvs")
 
+# Restore historical manual-HTTP defaults, not an MCP identity/auth mechanism.
+# Operators may replace the complete mapping using a JSON environment variable.
+# Values are checked on the allocated worker, never silently replaced by system Python.
+LEGACY_DEFAULT_USERNAME = "hank"
+LEGACY_NODE_VENVS = {
+  "ia-ai-server-5": "/storage/SSD2/hank/ComfyUI/venv",
+  "ia-ai-server-4": "/storage/SSD2/hank/gpu_training/venv",
+  "AI-Server-6": "/storage/SSD2/hank/gpu_training/venv",
+}
+
+
+def get_legacy_node_venvs() -> dict[str, str]:
+  """Snapshot Operator defaults; reject invalid settings before sbatch."""
+  raw = os.environ.get("GPU_PLATFORM_NODE_VENVS")
+  mapping = json.loads(raw) if raw is not None else dict(LEGACY_NODE_VENVS)
+  if not isinstance(mapping, dict) or not mapping:
+    raise ValueError("GPU_PLATFORM_NODE_VENVS must be a nonempty JSON object")
+  for node, venv_path in mapping.items():
+    if not isinstance(node, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", node):
+      raise ValueError("Default venv mapping contains an invalid node name")
+    if not isinstance(venv_path, str) or not venv_path.startswith("/") or "\n" in venv_path or "\r" in venv_path:
+      raise ValueError("Default venv mapping must contain absolute paths")
+  return mapping
+
+
+def render_job_environment(venv: str) -> str:
+  """Select/validate the environment on the worker before running user code."""
+  if venv:
+    selection = f"JOB_VENV={shlex.quote(resolve_venv(venv))}"
+  else:
+    cases = "\n".join(
+      f"    {node}) JOB_VENV={shlex.quote(path)} ;;"
+      for node, path in sorted(get_legacy_node_venvs().items())
+    )
+    selection = f'''case "${{SLURMD_NODENAME:-}}" in
+{cases}
+  *) echo "ERROR: No default venv configured for node ${{SLURMD_NODENAME:-unknown}}" >&2; exit 1 ;;
+esac'''
+  return f'''{selection}
+if [ ! -r "$JOB_VENV/bin/activate" ] || [ ! -x "$JOB_VENV/bin/python" ] || [ ! -x "$JOB_VENV/bin/python3" ]; then
+  echo "ERROR: Invalid job venv on ${{SLURMD_NODENAME:-unknown}}: $JOB_VENV (activate/python/python3 required)" >&2
+  exit 1
+fi
+source "$JOB_VENV/bin/activate"
+# Keep the selected directory ahead of PATH even if activate contains an old path.
+export PATH="$JOB_VENV/bin:$PATH"
+hash -r
+if ! "$JOB_VENV/bin/python" --version || ! "$JOB_VENV/bin/python3" --version; then
+  echo "ERROR: Job venv interpreter cannot start: $JOB_VENV" >&2
+  exit 1
+fi
+printf 'Job environment: node=%s venv=%s python=%s\\n' "${{SLURMD_NODENAME:-unknown}}" "$JOB_VENV" "$JOB_VENV/bin/python"
+'''
+
 def get_available_venvs() -> list[dict]:
     """掃描 VENVS_BASE 下的目錄，自動偵測可用 venvs"""
     venvs = []
@@ -538,11 +592,7 @@ def generate_script(
     else:
         work_dir = DEFAULT_REPO_DIR
 
-    if venv:
-        venv_path = resolve_venv(venv)
-        venv_activate = f"source {venv_path}/bin/activate"
-    else:
-        venv_activate = "# no venv specified"
+    venv_activate = render_job_environment(venv)
 
     if run_dir:
       git_sync = f"\ncd {shlex.quote(run_dir)}\n"
@@ -575,6 +625,7 @@ flock -w 60 .git/config git pull origin {branch}
 #SBATCH --output={str(log_path)}
 {nodelist_line}
 {mem_line}
+set -e
 {venv_activate}
 {git_sync}
 {command}
@@ -624,7 +675,7 @@ def submit_job(
                 submission_id=submission_id,
                 run_dir=source_metadata["run_path"],
             )
-        except (OSError, SourcePreparationError) as exc:
+        except (OSError, SourcePreparationError, ValueError) as exc:
             return {
                 "success": False,
                 "submission_id": submission_id,
@@ -1493,7 +1544,7 @@ def create_http_app():
         model_config = ConfigDict(extra="forbid")
 
         command: str                  # e.g. "python3 -u train.py --lr 0.001"
-        username: str                 # e.g. "alice" — determines /storage/SSD2/slurmjob/<username>/
+        username: str = ""            # legacy headerless HTTP defaults to hank; MCP must provide it
         gpu: int = 1
         job_name: str = "job"
         nodelist: str = ""
@@ -1509,10 +1560,14 @@ def create_http_app():
         submission_source: str = Header(default="", alias="X-Submission-Source"),
     ):
         source = submission_source.strip().lower()
-        if source not in {"mcp", "internal-ui"}:
-            raise HTTPException(status_code=403, detail="approved submission source is required")
+        if not source:
+          source = "manual-http"
+        elif source not in {"mcp", "internal-ui"}:
+          raise HTTPException(status_code=403, detail="unsupported submission source")
 
         username = req.username.strip()
+        if source == "manual-http" and not username:
+          username = LEGACY_DEFAULT_USERNAME
         command = req.command.strip()
         venv = req.venv.strip()
         if not username:
@@ -1521,8 +1576,16 @@ def create_http_app():
             raise HTTPException(status_code=400, detail="username contains unsupported characters")
         if not command:
             raise HTTPException(status_code=400, detail="command is required")
-        if not venv:
+        if not venv and source != "manual-http":
             raise HTTPException(status_code=400, detail="venv is required")
+        node_defaults = {}
+        if not venv:
+          try:
+            node_defaults = get_legacy_node_venvs()
+          except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid default venv configuration: {exc}") from exc
+          if req.nodelist and req.nodelist not in node_defaults:
+            raise HTTPException(status_code=400, detail="No default venv for requested nodelist; specify venv explicitly")
         if not 1 <= req.gpu <= 7:
             raise HTTPException(status_code=400, detail="gpu must be between 1 and 7")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", req.job_name):
@@ -1538,9 +1601,11 @@ def create_http_app():
             try:
                 repo_dir_path.relative_to(user_base_resolved)
             except ValueError:
+              # Exact historical demo source only; not arbitrary filesystem access.
+              if not (source == "manual-http" and str(repo_dir_path) == DEFAULT_REPO_DIR):
                 raise HTTPException(
-                    status_code=400,
-                    detail=f"repo_dir must be under {user_base}/ (got: {req.repo_dir})"
+                  status_code=400,
+                  detail=f"repo_dir must be under {user_base}/ (got: {req.repo_dir})"
                 )
             repo_dir = str(repo_dir_path)
         else:
@@ -1562,6 +1627,10 @@ def create_http_app():
             raise HTTPException(status_code=400, detail=result["error"])
         result["submission_source"] = source
         result["status"] = "submitted"
+        result["venv_policy"] = "explicit" if venv else "node-default"
+        result["requested_venv"] = venv
+        if node_defaults:
+          result["node_default_venvs"] = node_defaults
         request_payload = json.dumps(
           {
             "command": command,
@@ -1574,6 +1643,8 @@ def create_http_app():
             "repo_url": req.repo_url,
             "mem": req.mem,
             "venv": venv,
+            "venv_policy": result["venv_policy"],
+            "node_default_venvs": node_defaults,
           },
           sort_keys=True,
         )
