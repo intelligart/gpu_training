@@ -2,7 +2,9 @@
 
 這是**填寫範本，不是可直接執行的 job**。只預填已確認的 `username=hank`。
 每一次新實驗的 training venv、模型、dataset、command 均須確認；不沿用之前平台測試的 service venv。
-在 private notes 填寫，下列占位符未填完時不能提交。分享至 Git 的版本必須移除 secrets 和 private endpoints。
+在 private notes 填寫，下列占位符未填完時不能提交。分享至 Git 的版本必須移除
+secrets、個人設定與未核准的 private endpoints；團隊核准的 MCP URL
+`http://192.168.51.48:8766/mcp` 可記錄於內部文件，未來公開發佈另做去識別。
 Hank 已完成的 LTX-2.5 job 545 另見 [training 交接紀錄](../mcp-training-handoff-2026-10-20.md)；
 本範本不覆寫成歷史結果，也不授權重用該 job 的 output 或自動提交下一次。
 

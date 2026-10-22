@@ -1,8 +1,9 @@
 # 連線設定（client only）
 
 本文件是範本，不會自動修改你的設定。已經看得到 Slurm tools 的 client 不需要重設。
-請選自己的 client，只將 `<MCP_ENDPOINT>` 替換成 Operator 私下提供的完整 URL。
-不要把設定或 secrets 寫入 shared repository；不複製個人設定給其他人。
+請選自己的 client；以下使用團隊核准的內部 MCP `http://192.168.51.48:8766/mcp`。
+須有 VPN／內網 access；`8766` 是 MCP，`8765` 是 API，不可混用，不是公開服務。
+不要把個人設定或 secrets 寫入 shared repository；不複製個人設定給其他人。
 
 ## VS Code／GitHub Copilot
 
@@ -14,7 +15,7 @@
   "servers": {
     "slurmGpuCluster": {
       "type": "http",
-      "url": "<MCP_ENDPOINT>"
+      "url": "http://192.168.51.48:8766/mcp"
     }
   }
 }
@@ -34,7 +35,7 @@
   "mcpServers": {
     "slurm-gpu-cluster": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "<MCP_ENDPOINT>", "--allow-http"]
+      "args": ["-y", "mcp-remote", "http://192.168.51.48:8766/mcp", "--allow-http"]
     }
   }
 }

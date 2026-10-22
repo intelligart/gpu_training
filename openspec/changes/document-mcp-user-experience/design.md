@@ -45,7 +45,9 @@
 ### 2. 第一個動作永遠只讀，提交另行確認
 
 Quick start 的三分鐘是完成 client 連線及 discovery 的目標，不包含 VPN 開通、環境安裝或 training。
-使用者向 Operator 取得 endpoint、核准 username/venv 與資源政策；設定使用 `<MCP_ENDPOINT>`。
+使用者向 Operator 取得核准 username/venv 與資源政策，確認 VPN／內網 access。
+依 Owner 2026-10-22 修正，內部設定範例使用 `http://192.168.51.48:8766/mcp`；
+8766 是 MCP，8765 是 API，不得互換。個人設定仍留本機，credentials／tokens 不提交。
 範本先讀 `get_onboarding_guide`，再查 cluster、venvs、GPU；不提交、取消、安裝或執行 Python/model。
 缺工具、連線失敗、telemetry 不完整或 occupancy 不明時停止並交接。
 
@@ -66,7 +68,7 @@ Username 是 audit label，queue username filter 不是權限檢查；history �
 
 回應範例標為示意，區分工具回傳的文字／JSON 字串與 MCP transport envelope；不把回傳文字
 `Error:` 誤認為一致的 MCP `isError` 行為。結構化成功回應中的 submitted 不等於 training 成功。
-所有範例避免實際 endpoint、credentials 或可直接重送的既有寫入目錄。
+範例只使用 Owner 核准的內部 MCP endpoint，不含 credentials 或可直接重送的既有寫入目錄。
 
 ### 4. 版本與結果分開查證
 
@@ -94,7 +96,8 @@ Private repo 不應被當作網站天然私有的保證；私有 Pages 的權限
 - [首頁與工具參考再次漂移] → README 只保留摘要；參數表集中到工具參考，驗證 source signature 與文件工具集合。
 - [靜態版本表被誤認為即時查詢] → 標明紀錄日期與各自來源；不把 SDK、協定或內容版本當平台 release。
 - [文件範本觸發重複 job／覆寫輸出] → quick start 只讀；提交範例需新確認與獨立 output，timeout／缺 ID 不自動 retry。
-- [公開文件洩漏內網或身份資訊] → 本 change 使用占位符、不開 Pages；未來發佈另外決定 audience、allowlist 與存取控制。
+- [公開文件洩漏內網或身份資訊] → 本 change 僅在內部文件使用核准的 MCP URL、
+  不含 credentials、不開 Pages；未來公開發佈另做去識別並決定 audience、allowlist 與存取控制。
 - [新增文件混入待確認 commit] → 保留 index patch SHA-256 與 14 檔案集合，實作及驗證後比對，再依 Owner 指示分組 stage，另確認 commit 訊息。
 
 ### Wave validator 相容性
@@ -111,3 +114,7 @@ CLI 不可用仍維持 fail closed。以隔離 fixture 驗證合法 skip 可通�
 JSON 範例及工具／版本契約，另修正 validator 並驗證正反向 fixture，最後回報範圍與限制。不需要 package install、
 Python/model 執行、新 Slurm job 或 service restart。
 回復僅限本 change 的文件與 validator edits，保留使用者既有內容；不操作 live state 或重設 index。
+
+Owner 的內部 endpoint 修正另外涵蓋 training pack 的 client setup 與 migration card；
+與 README、MCP_GUIDE、quick start 同步端點及分享界線。這是文件修正，
+不修改 server bind、runtime guide、權限或已保存的歷史驗證紀錄。

@@ -30,14 +30,17 @@ Your MCP client
 
 ## 第一次連線：先只讀，不自動跑 demo
 
-1. 向 Operator 取得 MCP endpoint、VPN access、已確認的 username/venv 與資源政策。
+1. 確認 VPN／內網 access，使用 MCP `http://192.168.51.48:8766/mcp`；
+   向 Operator 取得已確認的 username/venv 與資源政策。
 2. 依 [quick start](docs/mcp-quickstart.md) 設定 VS Code/Copilot 或核准的 MCP client。
 3. 請 AI 讀指南、查 cluster／venvs／GPU，**不要提交或取消 job**。
 4. 若要 training，再填 [遷移資料卡](docs/training-user-pack/migration-card.md)，
    核對 worker／GPU occupancy、獨立 output、成功／停止條件，另行確認一次提交。
 
 使用者只連線 client，不需要安裝 Slurm 或自己的 MCP server。
-完整 endpoint 與 credentials 保留 machine-local，repository 只使用占位符。
+本文件使用團隊核准的內部 MCP endpoint；僅限 VPN／內網，不是公開服務。
+`8766` 是 MCP，`8765` 是 API，不要混用。Credentials 與個人設定保留 machine-local，
+不提交至 repository；未來公開文件網站另做去識別。
 MCP 不可用時停止；AI 不得改成本機、notebook training 或 raw API fallback。
 
 ## 目前能力與證據

@@ -57,7 +57,9 @@ Hank 的 job **545** 已用固定 Git source 加 NAS YAML、直接呼叫官方 e
 - Slurm queue 空或 node IDLE 不等於實體 GPU 空閒；`gpu_status` 缺 device rows 時停止 GPU 提交並找 Operator。
 - 目前沒有獨立 `job_status`；history／queue 消失不能證明 training 成功或 Slurm terminal state。
 - Training、evaluation、模型執行及 Python scripts 經 Slurm MCP；MCP 失敗不得降級到本機、notebook 或 raw API。
-- 不原地修改共享 venv，不碰其他人的 process，不把 endpoint、credentials 或 private config 提交至 Git。
+- 不原地修改共享 venv，不碰其他人的 process，不把 credentials 或個人 private config 提交至 Git。
+  團隊核准的內部 MCP 為 `http://192.168.51.48:8766/mcp`，僅限 VPN／內網；
+  其他 private endpoints 未經核准不提交，未來公開文件另做去識別。
 
 P0 telemetry 不完整時可記「client 連線通過、GPU readiness BLOCKED」。
 使用資料卡內 Operator 聯絡管道交接；收到新的 occupancy 核對與核准後才進入 P2。
@@ -65,7 +67,7 @@ P0 telemetry 不完整時可記「client 連線通過、GPU readiness BLOCKED」
 
 ## Operator 私下交付項目
 
-完整 MCP endpoint、VPN access、核准 venv、允許的節點範圍與 GPU/RAM 政策、
+確認上述內部 MCP URL 的 VPN access、核准 venv、允許的節點範圍與 GPU/RAM 政策、
 NAS dataset/output 路徑、程式 repository 存取與聯絡窗口。
 Client credentials 只在自己的 secret/config store 輸入，不貼到聊天或共享驗收記錄。
 

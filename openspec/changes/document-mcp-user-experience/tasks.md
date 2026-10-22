@@ -64,3 +64,20 @@ bash scripts/lint-agent-integrations.sh
 bash scripts/validate-wave-workflow.sh
 openspec validate document-mcp-user-experience --strict
 ```
+
+## 4. Owner 核准的內部 endpoint 修正
+
+2026-10-22，Owner 改以實際內部 endpoint 取代連線範例占位符。
+以上八項為原提交的歷史驗證，當中的占位符／不含 private-IP 要求不再作為本項門檻。
+File lane：README、MCP_GUIDE、quick start，以及 training pack README、
+client setup、migration card；不改 runtime guide、live service 或權限。
+
+- [x] 4.1 將內部 MCP 設定統一為 `http://192.168.51.48:8766/mcp`，清楚區分 8766 MCP 與 8765 API；保留 VPN／內網限制及 credentials／個人設定不提交規則，修正不一致的 endpoint 分享說明。驗證：六份文件 JSON／links 與 endpoint 一致，無 credentials；重跑 policy、Wave、OpenSpec strict 與 whitespace gates。
+
+驗證結果：六份文件 endpoint 一致，四個 JSON examples 可解析且使用正確 MCP URL，
+57 個 local links 存在，無 API URL 或常見 credential patterns；policy、Wave
+（0 errors／0 warnings）、strict 與 whitespace gates 通過。此為文件靜態驗證，
+不是新的 live connectivity 或 GPU readiness 證明。
+
+交付：另建確認過訊息的 commit，再依已核准目標 push；不部署、不公開網站、
+不直接修改 main。這些 Git 操作不作為文件實作 checkbox 的驗證替代。

@@ -26,7 +26,7 @@ Source checkout、Git HEAD、build artifact、installed 檔案與 running servic
 
 | Client | 連線方式 | 注意事項 |
 |---|---|---|
-| VS Code／GitHub Copilot | Operator 提供的 `<MCP_ENDPOINT>`，HTTP MCP 設定 | 詳見 [quick start](docs/mcp-quickstart.md)，設定只保留 machine-local |
+| VS Code／GitHub Copilot | `http://192.168.51.48:8766/mcp`，HTTP MCP 設定 | 詳見 [quick start](docs/mcp-quickstart.md)，個人設定只保留 machine-local |
 | Claude Code | 核准的 remote bridge profile | Private HTTP profile 的 `--allow-http` 不套用至公開網路 |
 | 其他 client | 須支援 remote MCP 並經 Operator 核准 | 不支援就停止，不提供 raw API fallback |
 | 只支援 tools | 呼叫 `get_onboarding_guide` | 不依賴可選 resource/prompt |
@@ -34,6 +34,9 @@ Source checkout、Git HEAD、build artifact、installed 檔案與 running servic
 
 Server source 亦有 stdio 模式，但一般使用者不需要另啟本機 server；
 那不是 remote MCP 故障時的替代執行路徑。
+
+以上 URL 是團隊內部 MCP，須有 VPN／內網 access；`8766` 是 MCP，`8765` 是 API，
+不可互換。這不是公開 endpoint，不能靠此位址讓無內網路由的 client 直接連線。
 
 ## 能力一覽
 
@@ -130,4 +133,5 @@ AI training/model/Python training script 仍只經 MCP。
 目前限受信任 VPN/private network；username 僅為 audit label，shared service identity
 不等於跨節點 UID/GID 已一致。沒有 sandbox、強制 dataset/venv 唯讀、worker preflight、
 SSO/RBAC 或跨使用者 ownership enforcement。獨立 output/cache 是使用規範，不是安全隔離。
-Endpoint／tokens 只放本機設定；公開說明網站不代表可以公開 MCP/API。
+內部 MCP URL 經 Owner 核准記錄於本文件；tokens／credentials 與個人設定只放本機。
+未來公開文件另做去識別；公開說明網站不代表可以公開 MCP/API。

@@ -7,17 +7,18 @@
 
 ## 1. 向 Operator 取得設定
 
-- 完整 `<MCP_ENDPOINT>`，以及必要的 VPN/private-LAN access。
+- 確認可透過 VPN/private-LAN 存取 `http://192.168.51.48:8766/mcp`。
 - 已確認的 `username` audit label、核准 `venv` 名稱或路徑。
 - 資源政策、dataset/output 可用位置與 Operator 聯絡方式。
 
 不從登入名稱或路徑猜 username/venv。Username 不是認證；目前是 shared execution pilot，
-沒有跨使用者權限隔離。Endpoint、tokens 與個人設定只保留在本機，不提交到 Git。
+沒有跨使用者權限隔離。Tokens、credentials 與個人設定只保留在本機，不提交到 Git。
+本文記錄團隊核准的內部 URL，不是公開服務；`8766` 是 MCP，`8765` 是 API，不可混用。
 你只需要支援 MCP 的 client，**不需要安裝 Slurm 或另一個 MCP server**。
 
 ## 2. 設定自己的 client
 
-選一種方式；將占位符換成 Operator 提供的完整 URL。已有其他 servers 時合併 entry，
+選一種方式；以下已填入內部 MCP URL。已有其他 servers 時合併 entry，
 不要覆蓋整份設定。工具 trust/permission 先限於只讀查詢。
 
 ### VS Code／GitHub Copilot
@@ -29,7 +30,7 @@
   "servers": {
     "slurmGpuCluster": {
       "type": "http",
-      "url": "<MCP_ENDPOINT>"
+      "url": "http://192.168.51.48:8766/mcp"
     }
   }
 }
@@ -44,7 +45,7 @@
   "mcpServers": {
     "slurm-gpu-cluster": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "<MCP_ENDPOINT>", "--allow-http"]
+      "args": ["-y", "mcp-remote", "http://192.168.51.48:8766/mcp", "--allow-http"]
     }
   }
 }
