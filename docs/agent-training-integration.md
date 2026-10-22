@@ -6,6 +6,10 @@ Claude、GitHub Copilot、ChatGPT 與後續 AI client 共用同一個 training c
 AI client -> approved remote MCP endpoint -> internal adapter -> Slurm
 ```
 
+這是 **AI client** 的 contract，不是禁止人類使用 curl。受信任的手動 HTTP 入口
+另見 [手動 HTTP 相容說明](manual-http-submission.md)；已部署的 1.0.1 手動
+相容修正不解除 AI MCP-only／明確 username 與 venv／不得 fallback 的規則。
+
 ## Client 設定
 
 1. 僅註冊管理員提供的 remote MCP endpoint。
@@ -17,6 +21,19 @@ AI client -> approved remote MCP endpoint -> internal adapter -> Slurm
    fallback。
 
 ## Submission 行為
+
+- Onboarding 1.0.1 已部署。新 server 首次使用先呼叫 `get_onboarding_guide`；
+   支援 resources/prompts 的 client 可讀 `slurm://guides/onboarding` 或取得 `slurm_onboarding`。
+   三種入口都是只讀且使用同一份內容；tools-only client 不依賴可選入口。
+- Client 只連 Operator 提供的 `<MCP_ENDPOINT>`，不需要安裝 MCP server。
+- 先用 `cluster_info`、`list_venvs` 做 discovery，補齊 program repo/ref/command、dataset
+   路徑或明確不需要、GPU/memory 與 output 約定；整理摘要，取得本次明確確認才提交。
+   確認是 client guidance，不是 backend authorization gate。
+- Dataset/output 目前只在 command 中指定；未提供 worker path/GPU preflight、sandbox、
+   強制唯讀或跨使用者隔離。所有 jobs 以 shared `hank` 執行，username 是 audit label。
+   手動 GPU workloads 與缺失 telemetry 交 Operator 核對；Bubblewrap/強制保護另案處理。
+- 追蹤使用 `list_jobs`、`job_history`、`get_logs` exact log；目前沒有 `job_status`，
+   資訊不足不推斷 terminal state。先查 job ID/name，再取得明確確認才 `cancel_job`。
 
 - 每次 training 都需要使用者已確認的 `username` 與 `venv`。
 - Agent 可以沿用同一對話中已確認的值，但不得由路徑、登入名稱或其他使用者推測。

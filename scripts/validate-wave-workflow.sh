@@ -132,10 +132,7 @@ for change_dir in openspec/changes/*; do
 	for artifact in proposal.md design.md tasks.md; do
 		[[ -f "$change_dir/$artifact" ]] || fail "$change_name is missing $artifact"
 	done
-	if [[ ! -d "$change_dir/specs" ]] ||
-		! /usr/bin/find "$change_dir/specs" -type f -name spec.md -print -quit | /usr/bin/grep -q .; then
-		fail "$change_name is missing a nested delta spec"
-	fi
+	# OpenSpec strict validation below enforces deltas and explicit skip_specs.
 done
 
 node_major=0

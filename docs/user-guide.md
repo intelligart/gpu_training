@@ -2,6 +2,13 @@
 
 本指南描述工程師如何把自己的測試、training code、dataset 與 Python environment 接到目前已上線的 GPU Platform v1。
 
+第一次連線先看 [三分鐘只讀 quick start](mcp-quickstart.md)；
+需要參數、輸出與副作用時看 [MCP 工具參考](mcp-tool-reference.md)。
+平台／guide／協定／SDK 版本分別見 [MCP 指南](../MCP_GUIDE.md#版本與相容性)。
+
+已會 training、只要遷移執行方式：從 [Training 使用者包](training-user-pack/README.md) 開始。
+先填自己的原始 command/venv，完成一次經核准的短跑，不需要先學 Slurm 維運。
+
 ## 1. 標準 flow
 
 ```text
@@ -22,7 +29,13 @@ Git commit + approved venv + versioned dataset
 | Shared venv | `/storage/Internal_NAS/venvs/<name>/` | Operator 建立、版本化，核准後不原地修改 |
 | Output、checkpoint | `/storage/Internal_NAS/experiments/` | 每個 Slurm job 使用獨立目錄 |
 
-AI-assisted training 只使用 MCP endpoint `http://192.168.51.48:8766/mcp`。完整 Dashboard/API 的 VPN URL 由 Operator 提供給受信任使用者；AI client 不得將 raw API 設成 fallback action。
+AI-assisted training 只使用 Operator 提供的 `<MCP_ENDPOINT>`。完整 Dashboard/API 的 VPN URL 由 Operator 提供給受信任使用者；AI client 不得將 raw API 設成 fallback action。
+
+人類手動 curl 不是 AI fallback。已部署的 1.0.1 恢復舊 HTTP payload 與
+Operator per-node default venv；詳見 [手動 HTTP 相容入口](manual-http-submission.md)。
+MCP 的 username／venv 必填規則不變。Hank 已在 server6 用固定 Git source 加 NAS YAML
+完成 LTX-2.5 五步短跑，詳見 [training 交接紀錄](mcp-training-handoff-2026-10-20.md)。
+這不驗證手動 curl submission、歷史 default venv、所有 workers 或新帳號隔離；這些仍需分別驗收。
 
 ## 2. 第一次 onboarding
 
@@ -41,21 +54,34 @@ Claude Code 的 machine-local MCP 設定：
   "mcpServers": {
     "slurm-gpu-cluster": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "http://192.168.51.48:8766/mcp", "--allow-http"]
+      "args": ["-y", "mcp-remote", "<MCP_ENDPOINT>", "--allow-http"]
     }
   }
 }
 ```
 
+將占位符替換為 Operator 提供的完整 MCP URL；只連線 client，不需安裝 MCP server。
+明文 HTTP 與 `--allow-http` 僅適用核准 VPN/private LAN；HTTPS profile 移除該旗標。
+已部署的 1.0.1 可先呼叫 `get_onboarding_guide`，或讀取
+`slurm://guides/onboarding` resource / `slurm_onboarding` prompt；三者內容相同且不提交 job。
+只支援 tools 的 client 不需要 resources/prompts。
 此 endpoint 只允許受信任的 private LAN。設定完成後先執行 read-only 驗證：
 
 ```text
 請用 Slurm MCP 列出 cluster 狀態、GPU 狀態與可用 venv，不要提交 job。
 ```
 
-預期使用 `cluster_info`、`gpu_status`、`list_venvs`，不應呼叫 raw HTTP API。若 `gpu_status` 只顯示 node 標題而沒有 device rows，這是目前已知的 MCP formatting issue；請 Operator 比對 backend telemetry，在確認實際 device occupancy 前不要提交 GPU job。
+預期使用 `cluster_info`、`gpu_status`、`list_venvs`，不應呼叫 raw HTTP API。1.0.1 已修正 nested GPU payload 的 formatting；若仍沒有 device rows，請 Operator 比對 backend telemetry，在確認實際 device occupancy 前不要提交 GPU job。
 
 ## 3. Training repository
+
+提交前提供 username/program repo/ref/command、dataset（或明確「不需要」）、venv、
+GPU/memory、output/checkpoint/cache 摘要，取得本次明確確認後才呼叫既有 `submit_job`。
+Dataset/output 暫為 command 約定；backend 沒有這兩個結構化欄位或 worker path/GPU preflight。
+指南確認不是 backend authorization；實際 jobs 以 shared `hank` 執行，username 僅供稽核。
+沒有強制 dataset/venv 唯讀、sandbox 或跨使用者權限隔離；獨立 output 是使用規範。
+Slurm IDLE 不代表無手動 GPU processes。Bubblewrap、強制 writable paths 與 preflight 另案實作。
+狀態使用 `list_jobs`/`job_history`；目前沒有 `job_status`，queue 消失不能證明 terminal state。
 
 建議專案結構：
 
@@ -222,11 +248,10 @@ torchrun --standalone --nproc_per_node=2 train.py \
 
 ## 7. GPU 數量與型號
 
-目前 MCP 接受 `gpu=1..7`，但實際可否排程取決於 `cluster_info` 的 live state：
-
-- `ia-ai-server-4`、`ia-ai-server-5`：各 2 張 RTX A6000。
-- `AI-Server-6`：混合 RTX 4090/5090；只有 node healthy 且 Slurm 已能可靠區分 typed GRES 時才可指定。
-- `nodelist` 選的是 node，不是特定 GPU index，也不能在 mixed node 保證 GPU model。
+目前 MCP 接受 `gpu=1..7`，但實際可否排程取決於 `cluster_info` 的 live state。
+GPU 型號、數量與 occupancy 以 `gpu_status` 或 Operator 核對的 read-only telemetry 為準，
+不要用文件內的靜態 inventory 決定排程。只有 node healthy 且 typed GRES 可可靠區分時才選型號。
+`nodelist` 選的是 node，不是特定 GPU index，也不能在 mixed node 保證 GPU model。
 
 一般 job 留空 `nodelist`，讓 Slurm 排程。只有測試硬體 compatibility 且 Owner/Operator 核准時才指定 node。v1 MCP 尚未提供 typed GPU constraint、multi-node parameters 或特定 GPU index；不要把 `gpu=4` 解讀成可以自動跨兩台 2-GPU node。
 
