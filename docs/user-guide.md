@@ -29,7 +29,9 @@ Git commit + approved venv + versioned dataset
 | Shared venv | `/storage/Internal_NAS/venvs/<name>/` | Operator 建立、版本化，核准後不原地修改 |
 | Output、checkpoint | `/storage/Internal_NAS/experiments/` | 每個 Slurm job 使用獨立目錄 |
 
-AI-assisted training 只使用 Operator 提供的 `<MCP_ENDPOINT>`。完整 Dashboard/API 的 VPN URL 由 Operator 提供給受信任使用者；AI client 不得將 raw API 設成 fallback action。
+AI-assisted training 只使用內部 MCP `http://192.168.51.48:8766/mcp`，
+須有核准 VPN／內網 access；`8766` 是 MCP，`8765` 是 API，不可混用。
+完整 Dashboard/API 的 VPN URL 由 Operator 提供給受信任使用者；AI client 不得將 raw API 設成 fallback action。
 
 人類手動 curl 不是 AI fallback。已部署的 1.0.1 恢復舊 HTTP payload 與
 Operator per-node default venv；詳見 [手動 HTTP 相容入口](manual-http-submission.md)。
@@ -54,13 +56,14 @@ Claude Code 的 machine-local MCP 設定：
   "mcpServers": {
     "slurm-gpu-cluster": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "<MCP_ENDPOINT>", "--allow-http"]
+      "args": ["-y", "mcp-remote", "http://192.168.51.48:8766/mcp", "--allow-http"]
     }
   }
 }
 ```
 
-將占位符替換為 Operator 提供的完整 MCP URL；只連線 client，不需安裝 MCP server。
+以上使用團隊核准的內部 MCP URL；只連線 client，不需安裝 MCP server。
+個人設定與 credentials 不提交到 Git，公開發佈文件前另做去識別。
 明文 HTTP 與 `--allow-http` 僅適用核准 VPN/private LAN；HTTPS profile 移除該旗標。
 已部署的 1.0.1 可先呼叫 `get_onboarding_guide`，或讀取
 `slurm://guides/onboarding` resource / `slurm_onboarding` prompt；三者內容相同且不提交 job。

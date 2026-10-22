@@ -81,3 +81,17 @@ client setup、migration card；不改 runtime guide、live service 或權限。
 
 交付：另建確認過訊息的 commit，再依已核准目標 push；不部署、不公開網站、
 不直接修改 main。這些 Git 操作不作為文件實作 checkbox 的驗證替代。
+
+## 5. Training 準備位置與提交資料
+
+2026-10-23，Owner 指出 quick start 未直接說明程式與 venv 放置位置，
+核准補齊 quick start、同步工程師指南內部 MCP URL 及本 task 紀錄。
+沿用既有 proposal／design 的文件範圍，不新增 server 或環境建立能力。
+
+- [x] 5.1 在 quick start 區分只讀連線與 training 準備，直接列出 Git source／完整 commit、NAS shared venv、dataset／base checkpoint 及獨立 output/cache 的位置與責任；補提交前必要資料和不自動提交的摘要範本，保留 NAS YAML 的版本紀錄與 worker 相容性限制。同步工程師指南 MCP URL。驗證：source 契約對照、JSON／links/anchors、正確內部 MCP URL、whitespace／policy／Wave／OpenSpec strict 全通過；不建環境、不執行 Python/model、不送 job、不部署，commit／push 另確認。
+
+2026-10-23 驗證：兩份使用文件共 14 個 links/anchors、四個 JSON examples 通過；
+NAS venv root、Git clone／固定 commit 契約對齊 source，準備位置與必要資料檢查通過。
+初次檢查發現新 venv link 的 heading anchor 缺少「建立」，已修正並重跑通過。
+Policy、Wave（0 errors／0 warnings）、OpenSpec strict 與 whitespace gates 通過；
+保留原 index 空白及其他 worktree 修改。這不是 live connectivity／環境／training 驗收。
