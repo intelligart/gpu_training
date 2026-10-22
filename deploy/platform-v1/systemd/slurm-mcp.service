@@ -8,11 +8,11 @@ Requires=slurm-api.service
 Type=simple
 User=hank
 Group=hank
-WorkingDirectory=/opt/gpu-platform/releases/1.0.0
+WorkingDirectory=/opt/gpu-platform/releases/1.0.1
 Environment=PYTHONUNBUFFERED=1
-Environment=GPU_PLATFORM_VERSION=1.0.0
+Environment=GPU_PLATFORM_VERSION=1.0.1
 Environment=SLURM_API_URL=http://127.0.0.1:8765
-ExecStart=/usr/bin/env /opt/gpu-platform/venvs/1.0.0/bin/python /opt/gpu-platform/releases/1.0.0/mcp_server.py --sse --host 192.168.51.48 --port 8766
+ExecStart=/usr/bin/env /opt/gpu-platform/venvs/1.0.0/bin/python /opt/gpu-platform/releases/1.0.1/mcp_server.py --sse --host 192.168.51.48 --port 8766
 Restart=on-failure
 RestartSec=5
 UMask=0027

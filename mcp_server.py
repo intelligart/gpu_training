@@ -17,6 +17,7 @@ import os
 
 import httpx
 from mcp.server.mcpserver import MCPServer
+from onboarding import GUIDE_URI, PROMPT_NAME, get_guide
 
 DASHBOARD_URL = os.environ.get("SLURM_API_URL", "http://127.0.0.1:8765")
 
@@ -25,6 +26,8 @@ mcp = MCPServer(
     instructions="""Slurm GPU Cluster management tools.
 Use these tools to submit training jobs, monitor GPU usage,
 check job status and logs, and manage the cluster.
+首次使用先呼叫 get_onboarding_guide；也可讀取 slurm://guides/onboarding
+或取得 slurm_onboarding prompt。先做只讀 discovery，整理工作摘要並取得確認後才提交。
 Data must be on Internal NAS (/storage/Internal_NAS/).
 Venvs are shared at /storage/Internal_NAS/venvs/.
 
@@ -39,12 +42,29 @@ Venvs are shared at /storage/Internal_NAS/venvs/.
 如果使用者之前已經說過 username 和 venv，記住並沿用，不用每次重複問。
 
 ## 叢集資訊
-- ia-ai-server-4：2 GPU (RTX A6000)
-- ia-ai-server-5：2 GPU (RTX A6000)
-- AI-Server-6：7 GPU (2x RTX 4090 + 5x RTX 5090)
+- 使用 cluster_info/gpu_status 查即時狀態，不猜 GPU 型號或空閒資源。
+- 所有 jobs 目前以 hank 執行，username 只用於稽核；尚未有 sandbox/強制唯讀隔離。
 - 共享 venv 位置：/storage/Internal_NAS/venvs/
 - Job 工作目錄：/storage/SSD2/slurmjob/<username>/""",
 )
+
+
+@mcp.tool()
+def get_onboarding_guide() -> str:
+    """首次使用必讀：只讀指南與提交/追蹤範本；不提交、取消或連接 backend。"""
+    return get_guide()
+
+
+@mcp.resource(GUIDE_URI, mime_type="text/markdown")
+def onboarding_resource() -> str:
+    """Read the same onboarding guide without side effects."""
+    return get_guide()
+
+
+@mcp.prompt(name=PROMPT_NAME)
+def onboarding_prompt() -> str:
+    """取得 onboarding 指南；閱讀後先收集工作資料，不自動提交。"""
+    return get_guide()
 
 
 def _api(method: str, path: str, **kwargs) -> dict:

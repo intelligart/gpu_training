@@ -1,13 +1,14 @@
 {
   "schema_version": 1,
-  "artifact_version": "1.0.0",
+  "artifact_version": "1.0.1",
   "python_version": "3.10.12",
-  "release_root": "/opt/gpu-platform/releases/1.0.0",
+  "release_root": "/opt/gpu-platform/releases/1.0.1",
   "venv_root": "/opt/gpu-platform/venvs/1.0.0",
   "requirements_lock": "deploy/platform-v1/requirements-service.lock",
   "source_files": [
     "mcp_server.py",
-    "slurm_server.py"
+    "slurm_server.py",
+    "onboarding.py"
   ],
   "services": {
     "slurm-api": {

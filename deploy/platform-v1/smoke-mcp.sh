@@ -65,10 +65,53 @@ curl --fail --silent --show-error --max-time 20 \
 	--data-binary '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"gpu_status","arguments":{}}}'
 /usr/bin/grep -q '"isError":false' "$body_file"
 
+curl --fail --silent --show-error --max-time 15 \
+	--output "$body_file" --request POST "$endpoint" \
+	--header 'Content-Type: application/json' \
+	--header 'Accept: application/json, text/event-stream' \
+	--header "Mcp-Session-Id: $session_id" \
+	--data-binary '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_onboarding_guide","arguments":{}}}'
+/usr/bin/grep -q '"isError":false' "$body_file"
+/usr/bin/grep -q 'Guide version: 1.0.0' "$body_file"
+
+curl --fail --silent --show-error --max-time 15 \
+	--output "$body_file" --request POST "$endpoint" \
+	--header 'Content-Type: application/json' \
+	--header 'Accept: application/json, text/event-stream' \
+	--header "Mcp-Session-Id: $session_id" \
+	--data-binary '{"jsonrpc":"2.0","id":5,"method":"resources/list","params":{}}'
+/usr/bin/grep -q 'slurm://guides/onboarding' "$body_file"
+
+curl --fail --silent --show-error --max-time 15 \
+	--output "$body_file" --request POST "$endpoint" \
+	--header 'Content-Type: application/json' \
+	--header 'Accept: application/json, text/event-stream' \
+	--header "Mcp-Session-Id: $session_id" \
+	--data-binary '{"jsonrpc":"2.0","id":51,"method":"resources/read","params":{"uri":"slurm://guides/onboarding"}}'
+/usr/bin/grep -q '"contents":' "$body_file"
+/usr/bin/grep -q 'Guide version: 1.0.0' "$body_file"
+
+curl --fail --silent --show-error --max-time 15 \
+	--output "$body_file" --request POST "$endpoint" \
+	--header 'Content-Type: application/json' \
+	--header 'Accept: application/json, text/event-stream' \
+	--header "Mcp-Session-Id: $session_id" \
+	--data-binary '{"jsonrpc":"2.0","id":6,"method":"prompts/list","params":{}}'
+/usr/bin/grep -q 'slurm_onboarding' "$body_file"
+
+curl --fail --silent --show-error --max-time 15 \
+	--output "$body_file" --request POST "$endpoint" \
+	--header 'Content-Type: application/json' \
+	--header 'Accept: application/json, text/event-stream' \
+	--header "Mcp-Session-Id: $session_id" \
+	--data-binary '{"jsonrpc":"2.0","id":61,"method":"prompts/get","params":{"name":"slurm_onboarding"}}'
+/usr/bin/grep -q '"messages":' "$body_file"
+/usr/bin/grep -q 'Guide version: 1.0.0' "$body_file"
+
 curl --fail --silent --show-error --max-time 5 \
 	--output /dev/null \
 	--request DELETE "$endpoint" \
 	--header "Mcp-Session-Id: $session_id"
 session_id=""
 
-printf 'MCP initialize, tool discovery, and read-only cluster query passed: %s\n' "$endpoint"
+printf 'MCP initialize, discovery, cluster/GPU queries, onboarding tool/resource/prompt reads passed: %s\n' "$endpoint"

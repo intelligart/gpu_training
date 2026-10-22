@@ -13,7 +13,15 @@ staging_root="$(mktemp -d)"
 trap 'rm -rf "$staging_root"' EXIT
 
 mkdir -p "$staging_root/$artifact_name/deploy"
-cp mcp_server.py slurm_server.py "$staging_root/$artifact_name/"
+node - "$staging_root/$artifact_name" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const manifest = JSON.parse(fs.readFileSync('deploy/platform-v1/artifact.json', 'utf8'));
+for (const file of manifest.source_files) {
+	if (!/^[A-Za-z0-9_-]+\.py$/.test(file)) throw new Error(`Unsafe source file: ${file}`);
+	fs.copyFileSync(file, path.join(process.argv[2], file));
+}
+NODE
 cp -a deploy/platform-v1 "$staging_root/$artifact_name/deploy/"
 
 mkdir -p "$output_dir"

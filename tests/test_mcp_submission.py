@@ -15,6 +15,12 @@ class _FakeMCPServer:
     def tool(self):
         return lambda function: function
 
+    def resource(self, *args, **kwargs):
+        return lambda function: function
+
+    def prompt(self, *args, **kwargs):
+        return lambda function: function
+
 
 mcp_module = types.ModuleType("mcp")
 mcp_server_package = types.ModuleType("mcp.server")

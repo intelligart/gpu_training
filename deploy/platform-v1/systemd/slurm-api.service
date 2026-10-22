@@ -7,11 +7,11 @@ Wants=network-online.target
 Type=simple
 User=hank
 Group=hank
-WorkingDirectory=/opt/gpu-platform/releases/1.0.0
+WorkingDirectory=/opt/gpu-platform/releases/1.0.1
 Environment=PYTHONUNBUFFERED=1
-Environment=GPU_PLATFORM_VERSION=1.0.0
+Environment=GPU_PLATFORM_VERSION=1.0.1
 Environment=SLURM_CONF=/etc/slurm/slurm.conf
-ExecStart=/usr/bin/env /opt/gpu-platform/venvs/1.0.0/bin/python /opt/gpu-platform/releases/1.0.0/slurm_server.py --http --host 127.0.0.1 --port 8765
+ExecStart=/usr/bin/env /opt/gpu-platform/venvs/1.0.0/bin/python /opt/gpu-platform/releases/1.0.1/slurm_server.py --http --host 127.0.0.1 --port 8765
 Restart=on-failure
 RestartSec=5
 UMask=0027

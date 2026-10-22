@@ -27,6 +27,18 @@ const fs = require('fs');
 const manifest = JSON.parse(fs.readFileSync('deploy/platform-v1/artifact.json', 'utf8'));
 if (manifest.schema_version !== 1) throw new Error('unsupported artifact schema');
 if (!/^\d+\.\d+\.\d+$/.test(manifest.artifact_version)) throw new Error('invalid artifact version');
+if (manifest.release_root !== `/opt/gpu-platform/releases/${manifest.artifact_version}`) {
+	throw new Error('release root and version disagree');
+}
+for (const file of ['mcp_server.py', 'slurm_server.py', 'onboarding.py']) {
+	if (!manifest.source_files.includes(file) || !fs.existsSync(file)) throw new Error(`Missing source: ${file}`);
+}
+for (const unit of [manifest.services['slurm-api'].unit, manifest.services['slurm-mcp'].unit,
+	manifest.profiles.trusted_vpn.api_drop_in]) {
+	if (!fs.readFileSync(unit, 'utf8').includes(`${manifest.release_root}/`)) {
+		throw new Error(`Unit does not use candidate release: ${unit}`);
+	}
+}
 if (manifest.python_version !== fs.readFileSync('deploy/platform-v1/python-version', 'utf8').trim()) {
   throw new Error('Python version files disagree');
 }
@@ -90,5 +102,6 @@ ARTIFACT_OUTPUT_DIR="$artifact_output" bash scripts/build-platform-v1-artifact.s
 artifact="$(find "$artifact_output" -maxdepth 1 -type f -name 'gpu-platform-v*.tar.gz' -print -quit)"
 [[ -n "$artifact" ]]
 sha256sum --check "$artifact.sha256" >/dev/null
+tar -tzf "$artifact" | /usr/bin/grep -q '/onboarding.py$'
 
 printf 'Deployment configuration is valid.\n'

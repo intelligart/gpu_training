@@ -25,7 +25,7 @@ printf '\n==> Python syntax\n'
 import ast
 from pathlib import Path
 
-files = [Path("mcp_server.py"), Path("slurm_server.py"), *sorted(Path("tests").glob("test_*.py"))]
+files = [Path("mcp_server.py"), Path("slurm_server.py"), Path("onboarding.py"), *sorted(Path("tests").glob("test_*.py"))]
 for file in files:
     ast.parse(file.read_text(), filename=str(file))
 print(f"Parsed {len(files)} Python files.")
