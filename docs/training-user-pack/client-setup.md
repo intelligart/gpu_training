@@ -26,9 +26,29 @@
 
 ## Claude Code
 
-下列為既有 trusted VPN/private HTTP profile 的 local-scope bridge 範本。
-使用自己的 local 設定，不以 project-wide shared config 發布。
-需要 Node.js／npx；bridge 不是在使用者端安裝 Slurm server。
+Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作目錄建立
+`.mcp.json`（或用 `claude mcp add -s project --transport http slurm-gpu-cluster http://192.168.51.48:8766/mcp`）：
+
+```json
+{
+  "mcpServers": {
+    "slurm-gpu-cluster": {
+      "type": "http",
+      "url": "http://192.168.51.48:8766/mcp"
+    }
+  }
+}
+```
+
+`.mcp.json` 只放 `type` 與 `url`，不要加 `"tools": [...]`，否則 Claude Code 會整個略過
+該 server。工具限制改用 `.claude/settings.local.json` 的 permissions。project-scope
+server 第一次要在該目錄執行 `claude` 走信任／核准對話框，之後 `claude mcp list` 應顯示
+`✔ Connected`；不要手改 `~/.claude.json` 去繞過核准。詳見
+[三分鐘只讀快速開始](../mcp-quickstart.md#claude-code)。
+
+若團隊政策要求既有 trusted VPN/private HTTP profile 的 local-scope bridge，可改用
+`mcp-remote`（使用自己的 local 設定，不以 project-wide shared config 發布；需要
+Node.js／npx，bridge 不是在使用者端安裝 Slurm server）：
 
 ```json
 {

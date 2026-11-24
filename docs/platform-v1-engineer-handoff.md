@@ -200,18 +200,25 @@ API health 必須回傳：
 - `/storage/Internal_NAS/` 下的 dataset/input path
 - GPU、memory 與允許 node 政策
 
-Claude Code 的 machine-local 設定範例：
+Claude Code 的 machine-local 設定範例（原生 HTTP，不需 Node.js／npx）：
 
 ```json
 {
   "mcpServers": {
     "slurm-gpu-cluster": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "http://192.168.51.48:8766/mcp", "--allow-http"]
+      "type": "http",
+      "url": "http://192.168.51.48:8766/mcp"
     }
   }
 }
 ```
+
+`.mcp.json` 只放 `type` 與 `url`，不要加 `"tools": [...]`；工具限制改用
+`.claude/settings.local.json` 的 permissions。project-scope server 第一次需在該目錄
+執行 `claude` 走信任／核准對話框（不要手改 `~/.claude.json` 繞過），之後
+`claude mcp list` 應為 `✔ Connected`。若政策要求 local bridge，改用
+`npx -y mcp-remote http://192.168.51.48:8766/mcp --allow-http`。詳見
+[三分鐘只讀快速開始](mcp-quickstart.md#claude-code)。
 
 不要提交 endpoint、token 或憑證到 Git。VS Code Copilot 與其他 client 也只註冊同一個 MCP URL；細節見 [MCP 使用說明](../MCP_GUIDE.md)。
 

@@ -49,7 +49,29 @@ MCP 的 username／venv 必填規則不變。Hank 已在 server6 用固定 Git s
 - 可讀取的 dataset/checkpoint path
 - 允許的 GPU 數量、memory 與 node policy
 
-Claude Code 的 machine-local MCP 設定：
+Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作目錄建立
+`.mcp.json`（或用 `claude mcp add -s project --transport http slurm-gpu-cluster http://192.168.51.48:8766/mcp`）：
+
+```json
+{
+  "mcpServers": {
+    "slurm-gpu-cluster": {
+      "type": "http",
+      "url": "http://192.168.51.48:8766/mcp"
+    }
+  }
+}
+```
+
+`.mcp.json` 只放 `type` 與 `url`，不要加 `"tools": [...]` 等其他 client 欄位，
+否則 Claude Code 會整個略過該 server。工具限制改用 `.claude/settings.local.json`
+的 permissions（只讀 allow、deny `submit_job`／`cancel_job`）。project-scope server
+第一次要在該目錄執行 `claude` 走信任／核准對話框，之後 `claude mcp list` 應顯示
+`✔ Connected`；不要手改 `~/.claude.json` 去繞過核准。詳見
+[三分鐘只讀快速開始](mcp-quickstart.md#claude-code)。
+
+若團隊政策要求走 local bridge profile，可改用 `mcp-remote`（需要 Node.js／npx，
+首次會下載 package）：
 
 ```json
 {
