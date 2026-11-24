@@ -223,5 +223,41 @@ Dataset/output 是 command/config 的內容，不是額外的 MCP tool 參數；
 Operator 核對 worker 路徑、環境與實際 occupancy，顯示摘要並取得本次明確確認後，
 才呼叫 [submit_job](mcp-tool-reference.md#submit_job) 一次。不要覆寫舊 output。
 
+### 送 job 前檢查
+
+程式放在自己的 repo 時，送出前逐項確認：
+
+1. **一定要填 `repo_url`。** 留空不會報錯，平台會改用預設的共用 checkout
+   `/storage/SSD2/hank/gpu_training`（branch 預設 `main`），你的 command 會跑在錯的程式上。
+2. **新的私有 repo 先確認平台讀得到。** Source 是由 MCP server 主機用平台自己的 Git
+   權限 clone，不是用你的權限。第一次用新 repo 前請 Operator 確認，或先送一個很小的 smoke job。
+3. **`branch` 填已 push 的完整 commit SHA。** 平台只拿得到 remote 上的 commit，
+   本機未 commit／未 push 的修改不會帶進去。
+4. **`command` 的路徑相對於 repo 根目錄。** 每個 job 會在
+   `/storage/Internal_NAS/slurm-runs/<username>/<submission_id>/` checkout 該 commit 並從這裡執行。
+5. **確認是否跑完看 `list_jobs` 與 `get_logs`。** `job_history` 的 Status 只記錄提交當下，
+   job 結束後仍顯示 `submitted`。
+
+實際例子（job 546，2026-11-24 的 onboarding smoke test）：
+
+```json
+{
+  "command": "python3 -u test_case1_single_gpu.py",
+  "username": "hank",
+  "venv": "yujong",
+  "gpu": 1,
+  "job_name": "hank-onboarding-smoke",
+  "nodelist": "ia-ai-server-5",
+  "repo_url": "git@github.com:intelligart/gpu_training.git",
+  "branch": "ac7aa01a85dd1837a7b304524c6f6cbbddf933e5"
+}
+```
+
+送出回應中的 `source_commit` 應等於你給的 SHA；`run_path`、`log_path` 指出這次的
+checkout 與 log 位置。Job 離開 `list_jobs` 後，用 `get_logs` 看到
+`Job environment: node=… venv=…` 與程式最後的完成訊息（此例為 `Training 完成！`），
+才算跑完。此例無 dataset／output；正式 training 仍需依上方範本提供新的獨立 output 路徑。
+`nodelist` 是當次經確認後指定的，一般情況留空由 Slurm 排程。
+
 已成功的 LTX-2.5 五步案例見 [job 545 交接紀錄](mcp-training-handoff-2026-10-20.md)；
 其歷史 output 已存在，不可直接重送。MCP 不可用時停止，不走 local/raw fallback。
