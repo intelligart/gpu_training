@@ -84,6 +84,8 @@ Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作�
 若詢問是否啟用 `.mcp.json` 的 server，選擇核准。未信任前 `settings.local.json`
 的 allow 規則會被忽略，`claude mcp list` 會顯示 `⏸ Pending approval`。
 完成後用 `claude mcp list` 確認 `slurm-gpu-cluster` 為 `✔ Connected`。
+核准是每台機器各做一次的互動步驟；請執行 `claude` 走對話框，不要手改
+`~/.claude.json` 等內部設定檔去繞過它（格式未保證，且會略過該有的信任確認）。
 
 **替代：mcp-remote bridge。** 若團隊政策要求走 local bridge profile，可改用下列 entry
 （需要 Node.js／npx，首次會下載 package，須符合公司政策；它不是在 client 安裝 Slurm server）：
