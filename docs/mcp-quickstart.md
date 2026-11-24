@@ -20,7 +20,7 @@
 ## 2. 設定自己的 client
 
 選一種方式；以下已填入內部 MCP URL。已有其他 servers 時合併 entry，
-不要覆蓋整份設定。工具 trust/permission 先限於只讀查詢。
+不要覆蓋整份設定。只讀工具直接允許；`submit_job`／`cancel_job` 可用，但每次執行前由本人確認。
 
 ### VS Code／GitHub Copilot
 
@@ -57,8 +57,8 @@ Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作�
 > 之類的其他 client 欄位：Claude Code 會**整個略過**這個 server，只在
 > `claude mcp list` 的 diagnostics 顯示警告。工具限制改用下方的 permissions。
 
-**限制為只讀工具。** Server 同時提供 `submit_job`、`cancel_job` 等會變更狀態的工具，
-且未標示 read-only。在同一目錄建立未追蹤的 `.claude/settings.local.json`：
+**設定工具權限。** Server 提供 9 個工具，其中 `submit_job`、`cancel_job` 會變更叢集狀態。
+在同一目錄建立未追蹤的 `.claude/settings.local.json`，只讀與監控工具直接允許：
 
 ```json
 {
@@ -68,17 +68,26 @@ Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作�
       "mcp__slurm-gpu-cluster__get_onboarding_guide",
       "mcp__slurm-gpu-cluster__cluster_info",
       "mcp__slurm-gpu-cluster__list_venvs",
-      "mcp__slurm-gpu-cluster__gpu_status"
-    ],
-    "deny": [
-      "mcp__slurm-gpu-cluster__submit_job",
-      "mcp__slurm-gpu-cluster__cancel_job"
+      "mcp__slurm-gpu-cluster__gpu_status",
+      "mcp__slurm-gpu-cluster__list_jobs",
+      "mcp__slurm-gpu-cluster__get_logs",
+      "mcp__slurm-gpu-cluster__job_history"
     ]
   }
 }
 ```
 
+`submit_job` 與 `cancel_job` **刻意不放進 `allow`，也不放進 `deny`**：預設就能送 job，
+但每次呼叫時 Claude Code 會跳出確認，由你看過參數再按允許。不要把這兩個加進 `allow`，
+否則 AI 會不經確認直接送出或取消 job。
 工具名稱格式是 `mcp__<server 名稱>__<tool>`；若 `.mcp.json` 用了別的 server 名稱，這裡要一起改。
+
+> ⚠️ **`username` 只是自填的稽核標籤，沒有驗證。** 所有 job 在 Slurm 與 OS 層實際都以
+> 同一個共用帳號執行；`job_history` 的 `User` 欄與工作目錄
+> `/storage/SSD2/slurmjob/<username>/` 是靠 `submit_job` 的 `username` 參數區分的。
+> 一律填 Operator 確認過的**你自己的** username，不要沿用別人的或共用帳號名稱。
+> `cancel_job` 只憑 `job_id`、不檢查擁有者：只取消自己的 job，取消前先用
+> `list_jobs`／`job_history` 確認該 job 的 `User` 是你。
 
 **第一次啟動要信任 workspace。** 在該目錄執行互動式 `claude`，接受 trust 對話框；
 若詢問是否啟用 `.mcp.json` 的 server，選擇核准。未信任前 `settings.local.json`
@@ -109,6 +118,7 @@ Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作�
 完成設定、啟動 client 的 MCP 連線後，填妥占位符並貼給 AI。
 這四個只讀工具不需要 username／venv；Operator 尚未提供時，把該行改成
 「username 與 venv 尚未由 Operator 確認，不要猜」即可先完成連線驗證。
+之後送 job 時，`username` 必須是你自己的（見第 2 節的稽核說明）。
 
 ```text
 請使用 Operator 核准的 Slurm MCP。

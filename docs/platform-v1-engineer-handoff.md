@@ -214,7 +214,8 @@ Claude Code 的 machine-local 設定範例（原生 HTTP，不需 Node.js／npx�
 ```
 
 `.mcp.json` 只放 `type` 與 `url`，不要加 `"tools": [...]`；工具限制改用
-`.claude/settings.local.json` 的 permissions。project-scope server 第一次需在該目錄
+`.claude/settings.local.json` 的 permissions（只讀與監控工具 allow；`submit_job`／`cancel_job`
+不列入、每次確認；`username` 為未驗證的自填稽核標籤，`cancel_job` 不檢查擁有者）。project-scope server 第一次需在該目錄
 執行 `claude` 走信任／核准對話框（不要手改 `~/.claude.json` 繞過），之後
 `claude mcp list` 應為 `✔ Connected`。若政策要求 local bridge，改用
 `npx -y mcp-remote http://192.168.51.48:8766/mcp --allow-http`。詳見
