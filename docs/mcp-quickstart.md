@@ -39,7 +39,54 @@
 
 ### Claude Code
 
-沿用受信任 private HTTP/VPN 的 local bridge profile，需要 Node.js／npx：
+Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作目錄建立
+`.mcp.json`（或用 `claude mcp add -s project --transport http slurm-gpu-cluster http://192.168.51.48:8766/mcp`）：
+
+```json
+{
+  "mcpServers": {
+    "slurm-gpu-cluster": {
+      "type": "http",
+      "url": "http://192.168.51.48:8766/mcp"
+    }
+  }
+}
+```
+
+> ⚠️ `.mcp.json` 只放 `type` 與 `url`。不要加入 `"tools": ["cluster_info", ...]`
+> 之類的其他 client 欄位：Claude Code 會**整個略過**這個 server，只在
+> `claude mcp list` 的 diagnostics 顯示警告。工具限制改用下方的 permissions。
+
+**限制為只讀工具。** Server 同時提供 `submit_job`、`cancel_job` 等會變更狀態的工具，
+且未標示 read-only。在同一目錄建立未追蹤的 `.claude/settings.local.json`：
+
+```json
+{
+  "enabledMcpjsonServers": ["slurm-gpu-cluster"],
+  "permissions": {
+    "allow": [
+      "mcp__slurm-gpu-cluster__get_onboarding_guide",
+      "mcp__slurm-gpu-cluster__cluster_info",
+      "mcp__slurm-gpu-cluster__list_venvs",
+      "mcp__slurm-gpu-cluster__gpu_status"
+    ],
+    "deny": [
+      "mcp__slurm-gpu-cluster__submit_job",
+      "mcp__slurm-gpu-cluster__cancel_job"
+    ]
+  }
+}
+```
+
+工具名稱格式是 `mcp__<server 名稱>__<tool>`；若 `.mcp.json` 用了別的 server 名稱，這裡要一起改。
+
+**第一次啟動要信任 workspace。** 在該目錄執行互動式 `claude`，接受 trust 對話框；
+若詢問是否啟用 `.mcp.json` 的 server，選擇核准。未信任前 `settings.local.json`
+的 allow 規則會被忽略，`claude mcp list` 會顯示 `⏸ Pending approval`。
+完成後用 `claude mcp list` 確認 `slurm-gpu-cluster` 為 `✔ Connected`。
+
+**替代：mcp-remote bridge。** 若團隊政策要求走 local bridge profile，可改用下列 entry
+（需要 Node.js／npx，首次會下載 package，須符合公司政策；它不是在 client 安裝 Slurm server）：
 
 ```json
 {
@@ -53,12 +100,13 @@
 ```
 
 `--allow-http` 只用於核准的 private HTTP profile；HTTPS profile 移除它。
-Bridge 可能需要下載 package，須符合公司政策；它不是在 client 安裝 Slurm server。
 其他 client 必須支援且獲准連線 remote MCP，不能直接套用不同 client 的 JSON。
 
 ## 3. 貼上第一個只讀請求
 
-完成設定、啟動 client 的 MCP 連線後，填妥占位符並貼給 AI：
+完成設定、啟動 client 的 MCP 連線後，填妥占位符並貼給 AI。
+這四個只讀工具不需要 username／venv；Operator 尚未提供時，把該行改成
+「username 與 venv 尚未由 Operator 確認，不要猜」即可先完成連線驗證。
 
 ```text
 請使用 Operator 核准的 Slurm MCP。
