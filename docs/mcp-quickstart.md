@@ -157,7 +157,7 @@ Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作�
 
 | 內容 | 放置位置 | 誰準備／注意事項 |
 |---|---|---|
-| 程式、一般 config、dependency lock | 叢集可讀取的 Git repository | 使用者先 commit／push，提供 `repo_url` 和已推送的完整 commit SHA |
+| 程式、一般 config、dependency lock | [intelligart](https://github.com/intelligart) 組織底下的 Git repository | 使用者先 commit／push，提供 `repo_url` 和已推送的完整 commit SHA |
 | Training venv | `/storage/Internal_NAS/venvs/<環境名稱>/` | Operator 建立、版本化並核准；MCP 用 `list_venvs` 查詢 |
 | Dataset | `/storage/Internal_NAS/datasets/<project>/<dataset>/<version>/` | 使用者與 Operator 確認 worker 可讀、版本與所需容量 |
 | Base model weights／輸入 checkpoint | `/storage/Internal_NAS/checkpoints/<project>/<model>/<version>/` | 不放 Git，不在 job 中修改共享輸入 |
@@ -171,7 +171,8 @@ Claude Code 原生支援 remote HTTP MCP，不需要 Node.js／npx。在工作�
 標準方式是開發自己的 Git 專案，commit／push 後由平台準備該 commit 的
 submission 專屬 source；平台不會帶入筆電上的未提交修改，也不需要另複製 NAS runner。
 一般 config 與 dependency lock 跟程式一起版本化，dataset、weights、venv 與 output 不放 Git。
-Private repo 必須由 Operator 確認平台 Git access，不要把 access token 寫進 URL。
+Repo 必須放在 intelligart 組織底下；個人帳號、其他組織或官方開源專案要先 fork／搬進 intelligart，
+見 [Git 存取](training-user-pack/git-access.md)。不要把 access token 寫進 URL。
 
 例如 Git 專案可以包含：
 
@@ -225,12 +226,13 @@ Operator 核對 worker 路徑、環境與實際 occupancy，顯示摘要並取�
 
 ### 送 job 前檢查
 
-程式放在自己的 repo 時，送出前逐項確認：
+送出前逐項確認：
 
-1. **一定要填 `repo_url`。** 留空不會報錯，平台會改用預設的共用 checkout
-   `/storage/SSD2/hank/gpu_training`（branch 預設 `main`），你的 command 會跑在錯的程式上。
-2. **新的私有 repo 先確認平台讀得到。** Source 是由 MCP server 主機用平台自己的 Git
-   權限 clone，不是用你的權限。第一次用新 repo 前請 Operator 確認，或先送一個很小的 smoke job。
+1. **一定要填 `repo_url`，而且 repo 在 intelligart 底下**（`git@github.com:intelligart/<repo>.git`）。
+   留空不會報錯，平台會改用預設的共用 checkout `/storage/SSD2/hank/gpu_training`
+   （branch 預設 `main`），你的 command 會跑在錯的程式上。
+2. **新 repo 先確認平台讀得到。** Source 是由 MCP server 主機用平台自己的 Git
+   權限 clone，不是用你的權限。第一次用新 repo 前先送一個很小的 smoke job，見 [Git 存取](training-user-pack/git-access.md)。
 3. **`branch` 填已 push 的完整 commit SHA。** 平台只拿得到 remote 上的 commit，
    本機未 commit／未 push 的修改不會帶進去。
 4. **`command` 的路徑相對於 repo 根目錄。** 每個 job 會在

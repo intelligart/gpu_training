@@ -9,6 +9,8 @@
 查參數、回應與副作用：看 [MCP 工具參考](../mcp-tool-reference.md)。
 已有連線、要搬自己的 training workflow，再依以下順序進行。
 
+0. 依 [Git 存取](git-access.md) 把程式放進 [intelligart](https://github.com/intelligart) 組織的 repo，
+   確認自己能 push、取得完整 commit SHA，並確認平台讀得到。
 1. 閱讀 [連線設定](client-setup.md)，確認自己的 client 能看見 Slurm tools。
 2. 將 [遷移資料卡](migration-card.md) 複製到自己的 private notes，填入原本 command 與 venv。
 3. 貼上 [P0 只讀檢查](prompts.md#p0-只讀連線與環境查詢)，不提交 job。

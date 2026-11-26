@@ -107,6 +107,14 @@ gpu=<核准數量>，mem=<host RAM>，output=<新的獨立路徑>。
 | 情況 | 處理 |
 |---|---|
 | MCP 無法連線／工具缺失 | 核對 VPN、Operator endpoint 與 client 設定，停止並回報；不改 server/firewall |
+| Claude Code 看不到 server，`claude mcp list` 有 diagnostics 警告 | `.mcp.json` 放了 `"tools": [...]` 等非 Claude Code 欄位，整個 server 被略過；只留 `type` 與 `url`，見 [quick start](docs/mcp-quickstart.md#claude-code) |
+| `claude mcp list` 顯示 `⏸ Pending approval` | 在該目錄執行互動式 `claude`，接受 trust 與 server 核准；不要手改 `~/.claude.json` |
+| SSH 顯示 `UNPROTECTED PRIVATE KEY FILE!` | Key 權限太開放被忽略；`chmod 600`，見 [Git 存取](docs/training-user-pack/git-access.md) |
+| `git clone` 顯示 `Repository not found` | 帳號不是 intelligart 成員或沒有該 repo 權限；找 intelligart 管理員，見 [Git 存取](docs/training-user-pack/git-access.md) |
+| 程式在個人帳號或其他組織的 repo | 不能直接送；先放進 intelligart（fork／transfer／新 repo），`repo_url` 用 `git@github.com:intelligart/<repo>.git` |
+| Job 跑到不是自己的程式 | `repo_url` 留空會改用預設共用 checkout；每次明確填 `repo_url` 與完整 SHA |
+| `job_history` 在 job 結束後仍是 `submitted` | 該欄只記提交當下；看 `list_jobs` 是否已離開 queue，再用 `get_logs` 確認完成訊息 |
+| `mem` 大於目標節點的實體 RAM | 該節點無法滿足配置；依節點 RAM 調整，或請 Operator 核准其他節點 |
 | `username and venv are required` | 補齊使用者已確認值；不要從路徑或登入名稱猜測 |
 | Venv 有列出但 job 啟動失敗 | Listing 不驗證 worker interpreter/CUDA；保存 exact log，交 Operator |
 | GPU 沒 device rows／有其他 processes | 不猜可用容量；Slurm IDLE 不代表無手動 workload |
